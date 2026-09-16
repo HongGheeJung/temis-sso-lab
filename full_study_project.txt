@@ -1,0 +1,5212 @@
+
+
+=========================================
+=== File: ./migrations/env.py ===
+=========================================
+
+import asyncio
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+from temis_sso.config import settings
+from temis_sso.persistence import Base
+
+config = context.config
+config.set_main_option("sqlalchemy.url", settings.database_url)
+if config.config_file_name:
+    fileConfig(config.config_file_name)
+target_metadata = Base.metadata
+
+
+def run_offline() -> None:
+    context.configure(
+        url=settings.database_url, target_metadata=target_metadata, literal_binds=True
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_online() -> None:
+    engine = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    async with engine.connect() as connection:
+
+        def run_migrations(sync_connection) -> None:
+            context.configure(
+                connection=sync_connection, target_metadata=target_metadata, compare_type=True
+            )
+            with context.begin_transaction():
+                context.run_migrations()
+
+        await connection.run_sync(run_migrations)
+    await engine.dispose()
+
+
+if context.is_offline_mode():
+    run_offline()
+else:
+    asyncio.run(run_online())
+
+
+=========================================
+=== File: ./migrations/versions/0001_auth_schema.py ===
+=========================================
+
+"""Create authentication-owned tables."""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "0001_auth_schema"
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "users",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("email", sa.String(320), nullable=False),
+        sa.Column("password_hash", sa.String(255)),
+        sa.Column("status", sa.String(20), nullable=False),
+        sa.Column("failed_logins", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("locked_until", sa.DateTime(timezone=True)),
+    )
+    op.create_index("ix_users_email", "users", ["email"], unique=True)
+    op.create_table(
+        "user_roles",
+        sa.Column(
+            "user_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column("role", sa.String(32), primary_key=True),
+    )
+    op.create_table(
+        "refresh_grants",
+        sa.Column("digest", sa.String(64), primary_key=True),
+        sa.Column(
+            "user_id", sa.String(36), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+        ),
+        sa.Column("audience", sa.String(80), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("consumed_at", sa.DateTime(timezone=True)),
+    )
+    op.create_index("ix_refresh_grants_user_id", "refresh_grants", ["user_id"])
+    op.create_table(
+        "one_time_tokens",
+        sa.Column("digest", sa.String(64), primary_key=True),
+        sa.Column(
+            "user_id", sa.String(36), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+        ),
+        sa.Column("purpose", sa.String(24), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("consumed_at", sa.DateTime(timezone=True)),
+    )
+    op.create_table(
+        "audit_logs",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("actor_id", sa.String(36), nullable=False),
+        sa.Column("target_id", sa.String(36), nullable=False),
+        sa.Column("action", sa.String(80), nullable=False),
+        sa.Column("details", sa.JSON(), nullable=False, server_default=sa.text("'{}'::json")),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("audit_logs")
+    op.drop_table("one_time_tokens")
+    op.drop_index("ix_refresh_grants_user_id", table_name="refresh_grants")
+    op.drop_table("refresh_grants")
+    op.drop_table("user_roles")
+    op.drop_index("ix_users_email", table_name="users")
+    op.drop_table("users")
+
+
+=========================================
+=== File: ./migrations/versions/0002_expand_authz_version.py ===
+=========================================
+
+"""Expand users with a backward-compatible authorization version."""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "0002_expand_authz_version"
+down_revision: str | None = "0001_auth_schema"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.add_column(
+        "users", sa.Column("authz_version", sa.Integer(), server_default="1", nullable=True)
+    )
+
+
+def downgrade() -> None:
+    op.drop_column("users", "authz_version")
+
+
+=========================================
+=== File: ./migrations/versions/0003_contract_authz_version.py ===
+=========================================
+
+"""Contract after every application version reads authorization versions."""
+
+from collections.abc import Sequence
+
+from alembic import op
+
+revision: str = "0003_contract_authz_version"
+down_revision: str | None = "0002_expand_authz_version"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.alter_column("users", "authz_version", nullable=False, server_default="1")
+
+
+def downgrade() -> None:
+    op.alter_column("users", "authz_version", nullable=True, server_default="1")
+
+
+=========================================
+=== File: ./migrations/versions/0004_external_identity_links.py ===
+=========================================
+
+"""Add provider-owned identity links to the authentication database."""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "0004_external_identity_links"
+down_revision: str | None = "0003_contract_authz_version"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "external_identity_links",
+        sa.Column("provider", sa.String(32), primary_key=True),
+        sa.Column("subject", sa.String(255), primary_key=True),
+        sa.Column(
+            "user_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+    op.create_index("ix_external_identity_links_user_id", "external_identity_links", ["user_id"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_external_identity_links_user_id", table_name="external_identity_links")
+    op.drop_table("external_identity_links")
+
+
+=========================================
+=== File: ./ops/BACKUP-RESTORE.md ===
+=========================================
+
+# PostgreSQL backup and isolated restore drill
+
+Create a custom-format archive with `pg_dump --format=custom --file "$archive" "$LAB_DATABASE_URL"`, then create its checksum with `sha256sum "$archive" > "$archive.sha256"`.
+
+For a drill, provision a new empty database that is not used by any service and create an explicit `public.temis_restore_target` marker table. Set `RESTORE_LIBPQ_URL` for `psql`/`pg_restore`, the matching `RESTORE_ASYNC_DATABASE_URL` for Alembic and application tests, and the exact `EXPECTED_RESTORE_DATABASE` name. The restore script verifies the checksum, queries the live database identity and marker through both drivers, and only then permits `pg_restore --clean`.
+
+Record row counts, migration revision, checksum, start/end timestamps, and the operator. Destroy the drill database after evidence is retained. A backup is not accepted until this restore succeeds.
+
+
+=========================================
+=== File: ./ops/E2E-FAILURE-MATRIX.md ===
+=========================================
+
+# End-to-end failure matrix
+
+| Boundary | Injected failure | Expected result | Evidence |
+| --- | --- | --- | --- |
+| BFF login | OAuth state missing or replayed | 401, no session cookie | BFF security test and rejected counter |
+| SSO token | authorization code replay or wrong PKCE | 401, code remains unusable | OAuth regression test |
+| Resource API | issuer, audience, azp, or signature mismatch | 401 | Resource API binding test |
+| Resource API | valid token without required scope | 403 | scope test |
+| JWKS | unknown kid after one refresh | 401, bounded upstream call | JWKS refresh test |
+| Redis | authenticated session is deleted | 401 until a new server session is created | automated Redis session-loss test |
+| PostgreSQL | connection unavailable | readiness down, no partial write | manual Compose drill; not asserted by `lab:test` |
+| Key rotation | retire requested before overlap | operation rejected; old token remains valid | automated cryptographic overlap test |
+| Migration | expand and contract order is reversed | stop rollout, deploy compatible schema | live sequential Alembic run plus migration contract test |
+| Backup | checksum mismatch | restore does not start | restore script output |
+| Application rollback | old reader against contracted schema | rollback application before schema | manual runbook drill; not asserted by `lab:test` |
+
+Automated evidence is produced by `lab:test`; rows explicitly marked manual are operator exercises and are not claimed as executed by the package. Run the whole matrix after changes to OAuth, token claims, key ring, migrations, or dependency clients. Store request IDs and aggregate metrics, never credentials or tokens.
+
+
+=========================================
+=== File: ./ops/INCIDENT-RUNBOOK.md ===
+=========================================
+
+# Authentication incident runbook
+
+Classify the symptom as availability, unauthorized access, key exposure, replay, or data integrity. Assign an incident lead and preserve timestamps, deployment identifiers, request IDs, redacted structured logs, and low-cardinality metrics.
+
+For suspected private-key exposure, publish and activate a new key, revoke affected sessions and refresh grants, then retire the exposed key after the deliberate emergency token policy is applied. For Redis loss, fail login and authenticated session reads closed. For PostgreSQL loss, mark readiness down and prevent state changes. For JWKS loss, use only an unexpired validated cache; unknown keys fail closed.
+
+Recovery is complete only after the E2E failure matrix passes and an isolated database restore succeeds. Document impact and corrective actions without copying credentials, cookies, authorization codes, or bearer tokens into the incident record.
+
+
+=========================================
+=== File: ./ops/MIGRATION-RUNBOOK.md ===
+=========================================
+
+# Expand and contract migration
+
+1. Back up and checksum the database.
+2. Apply revision `0002_expand_authz_version`; old and new application versions can both run.
+3. Deploy writers, backfill rows in bounded batches, then deploy readers.
+4. Verify no null values and exercise login, refresh, role change, and Resource API checks.
+5. Apply revision `0003_contract_authz_version` only after every running version reads the new column.
+6. Roll back the application before the schema while both versions remain compatible.
+
+Never combine destructive contraction with the first application deployment.
+
+
+=========================================
+=== File: ./ops/ROLLBACK-RUNBOOK.md ===
+=========================================
+
+# Rollback runbook
+
+1. Freeze deployments and record the current image digest, migration revision, active signing key, and incident request IDs.
+2. Stop traffic growth with the documented rate limit; do not disable authentication checks.
+3. Roll application instances back to the last compatible image. During expand/contract, roll back the application before the schema.
+4. Keep both old and new public keys published until every token signed by the old active key has expired.
+5. Verify login, refresh, logout, Resource API 401/403 behavior, readiness, and dependency metrics.
+6. Resume traffic gradually and record the final evidence. Forward repair uses a reviewed migration; production data is not manually rewritten during the incident.
+
+
+=========================================
+=== File: ./ops/SECRET-BOUNDARY.md ===
+=========================================
+
+# Secret boundary
+
+The loopback-only Compose file uses PostgreSQL trust authentication for a disposable learning host. It is not a production credential pattern.
+
+In a deployed environment, inject database passwords, Redis credentials, OAuth client secrets, and private signing keys from the platform secret store. Mount each value as a read-only file, grant it only to the service that consumes it, and never bake it into an image, archive, log, source file, or browser response. Public keys and JWKS are not secrets.
+
+The BFF may read OAuth client credentials and session encryption material. The Resource API receives only public JWKS material. The SSO signer alone reads private signing keys.
+
+
+=========================================
+=== File: ./README.md ===
+=========================================
+
+# TEMIS SSO Lab
+
+An independent learning project for building a small FastAPI single sign-on
+service. The code uses local-only defaults and contains no production data,
+credentials, hosts, or source copied from an internal service.
+
+## Local setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+```
+
+Step 1–2 tests run without infrastructure. From Step 3 onward, start the
+loopback-only PostgreSQL and Redis services and apply the checked-in migration:
+
+```bash
+docker compose up -d --wait
+alembic upgrade head
+```
+
+From Step 5 onward, generate the persistent local signing identity once:
+
+```bash
+python -m temis_sso.keygen
+pytest -q
+uvicorn temis_sso.main:app --reload
+```
+
+The generated `var/keys` directory is local state and must not be committed.
+
+
+=========================================
+=== File: ./scripts/backup-postgres.sh ===
+=========================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+: "${LAB_DATABASE_URL:?set the source database URL}"
+: "${OUTPUT_DIR:?set a protected backup directory}"
+mkdir -p "$OUTPUT_DIR"
+archive="$OUTPUT_DIR/temis-sso-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump --format=custom --file "$archive" "$LAB_DATABASE_URL"
+sha256sum "$archive" > "$archive.sha256"
+echo "$archive"
+
+
+=========================================
+=== File: ./scripts/restore-isolated.sh ===
+=========================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ARCHIVE:?set the archive path}"
+: "${RESTORE_LIBPQ_URL:?set an isolated libpq restore URL}"
+: "${RESTORE_ASYNC_DATABASE_URL:?set the matching async SQLAlchemy URL}"
+: "${EXPECTED_RESTORE_DATABASE:?set the exact isolated database name}"
+if [[ -n "${PRODUCTION_LIBPQ_URL:-}" && "$RESTORE_LIBPQ_URL" == "$PRODUCTION_LIBPQ_URL" ]]; then
+  echo "refusing to restore into the production libpq URL" >&2
+  exit 2
+fi
+if [[ -n "${PRODUCTION_ASYNC_DATABASE_URL:-}" && "$RESTORE_ASYNC_DATABASE_URL" == "$PRODUCTION_ASYNC_DATABASE_URL" ]]; then
+  echo "refusing to restore into the production async URL" >&2
+  exit 2
+fi
+export TEMIS_LAB_DATABASE_URL="$RESTORE_ASYNC_DATABASE_URL"
+python_bin="${PYTHON_BIN:-python3}"
+sha256sum --check "$ARCHIVE.sha256"
+identity="$(psql "$RESTORE_LIBPQ_URL" -AtF '|' -c "select current_database(), to_regclass('public.temis_restore_target') is not null")"
+if [[ "$identity" != "$EXPECTED_RESTORE_DATABASE|t" ]]; then
+  echo "refusing to restore: target identity or isolated marker mismatch" >&2
+  exit 3
+fi
+"$python_bin" scripts/verify-restore-target.py
+pg_restore --exit-on-error --clean --if-exists --dbname "$RESTORE_LIBPQ_URL" "$ARCHIVE"
+alembic upgrade head
+pytest -q tests/test_system.py tests/test_auth_data.py
+
+
+=========================================
+=== File: ./scripts/verify-restore-target.py ===
+=========================================
+
+import asyncio
+import os
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+async def verify() -> None:
+    url = os.environ["RESTORE_ASYNC_DATABASE_URL"]
+    expected = os.environ["EXPECTED_RESTORE_DATABASE"]
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "select current_database(), "
+                        "to_regclass('public.temis_restore_target') is not null"
+                    )
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+    if tuple(row) != (expected, True):
+        raise SystemExit("refusing to restore: async target identity or marker mismatch")
+
+
+asyncio.run(verify())
+
+
+=========================================
+=== File: ./src/resource_api/app.py ===
+=========================================
+
+from typing import Annotated
+
+from fastapi import FastAPI, Header, HTTPException, status
+
+from resource_api.auth import (
+    DependencyUnavailable,
+    JwksVerifier,
+    ScopeDenied,
+    TokenRejected,
+    require_scope,
+)
+from temis_sso.observability import Metrics, install_observability
+
+
+def create_resource_app(
+    verifier: JwksVerifier, metrics: Metrics | None = None, log_sink: list[str] | None = None
+) -> FastAPI:
+    app = FastAPI(title="TEMIS Resource API Lab")
+
+    @app.get("/api/reports")
+    async def reports(authorization: Annotated[str | None, Header()] = None) -> dict[str, str]:
+        if authorization is None or not authorization.startswith("Bearer "):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bearer token required")
+        try:
+            principal = await verifier.authenticate(authorization.removeprefix("Bearer "))
+            require_scope(principal, "reports:read")
+            if "temis:user" not in principal.roles and "temis:admin" not in principal.roles:
+                raise ScopeDenied("TEMIS role required")
+        except DependencyUnavailable as error:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(error)) from error
+        except TokenRejected as error:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(error)) from error
+        except ScopeDenied as error:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(error)) from error
+        return {"subject": principal.subject}
+
+    install_observability(
+        app,
+        "resource-api",
+        metrics or Metrics(),
+        None if log_sink is None else log_sink.append,
+    )
+    return app
+
+
+=========================================
+=== File: ./src/resource_api/auth.py ===
+=========================================
+
+import asyncio
+import json
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import cast
+
+import httpx
+import jwt
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+JwksFetch = Callable[[], Awaitable[dict[str, object]]]
+StatusCheck = Callable[[str, int], Awaitable[bool]]
+Clock = Callable[[], float]
+
+
+class HttpStatusClient:
+    def __init__(self, endpoint: str, service_key: str) -> None:
+        self.endpoint = endpoint
+        self.service_key = service_key
+
+    async def check(self, subject: str, version: int) -> bool:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.post(
+                self.endpoint,
+                json={"user_id": subject, "authz_version": version},
+                headers={"X-Status-Key": self.service_key},
+            )
+        if response.status_code != 200:
+            raise DependencyUnavailable("authorization status unavailable")
+        payload = response.json()
+        return bool(payload.get("active")) if isinstance(payload, dict) else False
+
+
+class TokenRejected(ValueError):
+    """Maps to HTTP 401 because authentication did not succeed."""
+
+
+class ScopeDenied(PermissionError):
+    """Maps to HTTP 403 because authentication succeeded without permission."""
+
+
+class DependencyUnavailable(RuntimeError):
+    """Maps to HTTP 503 because a verification dependency is unavailable."""
+
+
+@dataclass(frozen=True)
+class Principal:
+    subject: str
+    scopes: frozenset[str]
+    roles: frozenset[str]
+    authz_version: int
+
+
+class JwksVerifier:
+    def __init__(
+        self,
+        fetch_jwks: JwksFetch,
+        status_check: StatusCheck,
+        *,
+        issuer: str,
+        audience: str,
+        authorized_party: str,
+        jwks_ttl: float = 300,
+        jwks_stale_ttl: float = 600,
+        status_ttl: float = 30,
+        refresh_cooldown: float = 1,
+        clock: Clock = time.monotonic,
+    ) -> None:
+        self.fetch_jwks = fetch_jwks
+        self.status_check = status_check
+        self.issuer = issuer
+        self.audience = audience
+        self.authorized_party = authorized_party
+        self.jwks_ttl = jwks_ttl
+        self.jwks_stale_ttl = jwks_stale_ttl
+        self.status_ttl = status_ttl
+        self.refresh_cooldown = refresh_cooldown
+        self.clock = clock
+        self._keys: dict[str, RSAPublicKey] = {}
+        self._jwks_until = 0.0
+        self._jwks_stale_until = 0.0
+        self._status: dict[str, tuple[float, int]] = {}
+        self._negative_kids: dict[str, float] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._unknown_refresh_after = 0.0
+        self._refresh_error_until = 0.0
+
+    async def _refresh(self) -> None:
+        document = await self.fetch_jwks()
+        raw_keys = document.get("keys")
+        if not isinstance(raw_keys, list):
+            raise TokenRejected("invalid JWKS document")
+        keys: dict[str, RSAPublicKey] = {}
+        for value in raw_keys:
+            if not isinstance(value, dict) or value.get("alg") != "RS256":
+                continue
+            kid = value.get("kid")
+            if not isinstance(kid, str):
+                continue
+            key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(value))
+            if isinstance(key, RSAPublicKey):
+                keys[kid] = key
+        if not keys:
+            raise TokenRejected("JWKS has no RS256 signing keys")
+        self._keys = keys
+        self._jwks_until = self.clock() + self.jwks_ttl
+        self._jwks_stale_until = self.clock() + self.jwks_ttl + self.jwks_stale_ttl
+
+    async def _safe_refresh(self) -> None:
+        try:
+            await self._refresh()
+        except TokenRejected:
+            raise
+        except Exception as error:
+            raise DependencyUnavailable("JWKS unavailable") from error
+
+    async def authenticate(self, token: str) -> Principal:
+        try:
+            header = jwt.get_unverified_header(token)
+        except jwt.PyJWTError as error:
+            raise TokenRejected("malformed bearer token") from error
+        if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+            raise TokenRejected("RS256 token with kid required")
+        kid = cast(str, header["kid"])
+        if self.clock() >= self._jwks_until:
+            async with self._refresh_lock:
+                if self.clock() >= self._jwks_until:
+                    if self.clock() < self._refresh_error_until:
+                        if kid not in self._keys or self.clock() >= self._jwks_stale_until:
+                            raise DependencyUnavailable("JWKS unavailable")
+                    else:
+                        try:
+                            await self._safe_refresh()
+                            self._refresh_error_until = 0.0
+                        except DependencyUnavailable:
+                            self._refresh_error_until = self.clock() + self.refresh_cooldown
+                            if kid not in self._keys or self.clock() >= self._jwks_stale_until:
+                                raise
+        key = self._keys.get(kid)
+        if key is None:
+            if self.clock() < self._negative_kids.get(kid, 0.0):
+                raise TokenRejected("unknown signing key")
+            async with self._refresh_lock:
+                key = self._keys.get(kid)
+                if self.clock() < self._negative_kids.get(kid, 0.0):
+                    raise TokenRejected("unknown signing key")
+                if self.clock() < self._refresh_error_until:
+                    raise DependencyUnavailable("JWKS unavailable")
+                if key is None and self.clock() >= self._unknown_refresh_after:
+                    self._unknown_refresh_after = self.clock() + min(self.jwks_ttl, 30.0)
+                    try:
+                        await self._safe_refresh()
+                        self._refresh_error_until = 0.0
+                    except DependencyUnavailable:
+                        self._refresh_error_until = self.clock() + self.refresh_cooldown
+                        raise
+                    key = self._keys.get(kid)
+                if key is None:
+                    self._negative_kids[kid] = self.clock() + min(self.jwks_ttl, 30.0)
+                    raise TokenRejected("unknown signing key")
+        try:
+            claims = cast(
+                dict[str, object],
+                jwt.decode(
+                    token,
+                    key,
+                    algorithms=["RS256"],
+                    issuer=self.issuer,
+                    audience=self.audience,
+                    options={
+                        "require": ["iss", "aud", "sub", "exp", "azp", "scope", "authz_version"]
+                    },
+                ),
+            )
+        except jwt.PyJWTError as error:
+            raise TokenRejected("token validation failed") from error
+        subject = claims.get("sub")
+        version = claims.get("authz_version")
+        if (
+            claims.get("aud") != self.audience
+            or claims.get("azp") != self.authorized_party
+            or not isinstance(subject, str)
+            or not isinstance(version, int)
+        ):
+            raise TokenRejected("token binding is invalid")
+        status = self._status.get(subject)
+        if status is None or self.clock() >= status[0] or status[1] != version:
+            try:
+                active = await self.status_check(subject, version)
+            except Exception as error:
+                raise DependencyUnavailable("authorization status unavailable") from error
+            if not active:
+                raise TokenRejected("subject is inactive or stale")
+            self._status[subject] = (self.clock() + self.status_ttl, version)
+        scopes = frozenset(str(claims["scope"]).split())
+        raw_roles = claims.get("https://temis.lab/roles", [])
+        roles = (
+            frozenset(str(role) for role in raw_roles)
+            if isinstance(raw_roles, list)
+            else frozenset()
+        )
+        return Principal(subject, scopes, roles, version)
+
+
+def require_scope(principal: Principal, required: str) -> None:
+    if required not in principal.scopes:
+        raise ScopeDenied(f"scope required: {required}")
+
+
+=========================================
+=== File: ./src/resource_api/__init__.py ===
+=========================================
+
+"""TEMIS resource API authentication boundary."""
+
+
+=========================================
+=== File: ./src/temis_bff/app.py ===
+=========================================
+
+from collections.abc import Awaitable, Callable
+
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
+
+from temis_bff.oauth import BffOAuthFlow, OAuthFailed
+from temis_bff.security import RequestRejected, require_csrf, session_cookie
+from temis_bff.sessions import RedisSessionStore
+from temis_sso.observability import Metrics, install_observability
+
+Exchange = Callable[[str, str], Awaitable[dict[str, str]]]
+Revoke = Callable[[str], Awaitable[None]]
+
+
+def create_bff_app(
+    flow: BffOAuthFlow,
+    sessions: RedisSessionStore,
+    exchange: Exchange,
+    revoke: Revoke,
+    *,
+    public_origin: str = "http://localhost:3000",
+    production: bool = False,
+    metrics: Metrics | None = None,
+    log_sink: list[str] | None = None,
+) -> FastAPI:
+    app = FastAPI(title="TEMIS BFF Lab")
+    cookie = session_cookie(production=production)
+
+    @app.middleware("http")
+    async def protect_session_cache(
+        request: Request, call_next: Callable[..., Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path == "/bff/session":
+            response.headers["Cache-Control"] = "no-store, private"
+        return response
+
+    @app.get("/login")
+    async def login(return_to: str = "/") -> RedirectResponse:
+        try:
+            _, location = await flow.begin(return_to)
+        except RequestRejected as error:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
+        return RedirectResponse(location, status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.get("/auth/callback")
+    async def callback(code: str, state: str) -> RedirectResponse:
+        try:
+            tokens, return_to = await flow.complete(state, code, exchange)
+        except OAuthFailed as error:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(error)) from error
+        session_id = await sessions.create(
+            tokens["user_id"], tokens["access_token"], tokens["refresh_token"]
+        )
+        response = RedirectResponse(return_to, status_code=status.HTTP_303_SEE_OTHER)
+        response.set_cookie(
+            key=str(cookie["key"]),
+            value=session_id,
+            max_age=sessions.ttl_seconds,
+            httponly=True,
+            secure=production,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    @app.get("/bff/session")
+    async def session_info(request: Request) -> dict[str, str]:
+        session_id = request.cookies.get(str(cookie["key"]))
+        session = None if session_id is None else await sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session required")
+        return {"user_id": session.user_id, "csrf_token": session.csrf_token}
+
+    @app.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+    async def logout(
+        request: Request, response: Response, x_csrf_token: str | None = Header(default=None)
+    ) -> None:
+        session_id = request.cookies.get(str(cookie["key"]))
+        session = None if session_id is None else await sessions.get(session_id)
+        if session_id is None or session is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session required")
+        try:
+            require_csrf(
+                request.headers.get("origin"), public_origin, x_csrf_token, session.csrf_token
+            )
+        except RequestRejected as error:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(error)) from error
+        await revoke(session.refresh_token)
+        await sessions.delete(session_id)
+        response.delete_cookie(
+            key=str(cookie["key"]), path="/", secure=production, httponly=True, samesite="lax"
+        )
+
+    install_observability(
+        app, "bff", metrics or Metrics(), None if log_sink is None else log_sink.append
+    )
+    return app
+
+
+=========================================
+=== File: ./src/temis_bff/oauth.py ===
+=========================================
+
+import base64
+import hashlib
+import json
+import secrets
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass
+from urllib.parse import urlencode
+
+import httpx
+from redis.asyncio import Redis
+
+from temis_bff.security import safe_return_path
+
+
+class OAuthFailed(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class LoginTransaction:
+    verifier: str
+    return_to: str
+
+
+TokenExchange = Callable[[str, str], Awaitable[dict[str, str]]]
+
+
+class OAuthTokenClient:
+    def __init__(self, endpoint: str, client_id: str, redirect_uri: str) -> None:
+        self.endpoint = endpoint
+        self.client_id = client_id
+        self.redirect_uri = redirect_uri
+
+    async def exchange(self, code: str, verifier: str) -> dict[str, str]:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                self.endpoint,
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": self.client_id,
+                    "redirect_uri": self.redirect_uri,
+                    "code": code,
+                    "code_verifier": verifier,
+                },
+            )
+        if response.status_code != 200:
+            raise OAuthFailed("token endpoint rejected authorization code")
+        payload = response.json()
+        if not isinstance(payload, dict) or not all(
+            isinstance(value, str) for value in payload.values()
+        ):
+            raise OAuthFailed("token response is invalid")
+        return payload
+
+
+class BffOAuthFlow:
+    def __init__(
+        self, redis_url: str, authorize_endpoint: str, client_id: str, redirect_uri: str
+    ) -> None:
+        self.redis_url = redis_url
+        self.authorize_endpoint = authorize_endpoint
+        self.client_id = client_id
+        self.redirect_uri = redirect_uri
+
+    async def begin(self, return_to: str) -> tuple[str, str]:
+        state = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(48)
+        transaction = LoginTransaction(verifier, safe_return_path(return_to))
+        key = f"temis-bff:oauth:{hashlib.sha256(state.encode()).hexdigest()}"
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            await redis.set(key, json.dumps(asdict(transaction)), ex=300)
+        challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        query = urlencode(
+            {
+                "client_id": self.client_id,
+                "redirect_uri": self.redirect_uri,
+                "response_type": "code",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+            }
+        )
+        return state, f"{self.authorize_endpoint}?{query}"
+
+    async def complete(
+        self, state: str, code: str, exchange: TokenExchange
+    ) -> tuple[dict[str, str], str]:
+        key = f"temis-bff:oauth:{hashlib.sha256(state.encode()).hexdigest()}"
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            raw = await redis.getdel(key)
+        if raw is None:
+            raise OAuthFailed("invalid or reused state")
+        transaction = LoginTransaction(**json.loads(raw))
+        try:
+            tokens = await exchange(code, transaction.verifier)
+            if not {"user_id", "access_token", "refresh_token"} <= tokens.keys():
+                raise OAuthFailed("token response is incomplete")
+        except Exception as error:
+            if isinstance(error, OAuthFailed):
+                raise
+            raise OAuthFailed("token exchange failed") from error
+        return tokens, transaction.return_to
+
+
+=========================================
+=== File: ./src/temis_bff/security.py ===
+=========================================
+
+import hmac
+from urllib.parse import unquote, urlsplit
+
+
+class RequestRejected(ValueError):
+    pass
+
+
+def safe_return_path(value: str) -> str:
+    decoded = unquote(value)
+    parsed = urlsplit(decoded)
+    unsafe_character = "\\" in decoded or any(ord(character) < 32 for character in decoded)
+    if (
+        not decoded.startswith("/")
+        or decoded.startswith("//")
+        or parsed.scheme
+        or parsed.netloc
+        or unsafe_character
+    ):
+        raise RequestRejected("return path must be local")
+    return decoded
+
+
+def require_csrf(
+    origin: str | None, expected_origin: str, supplied: str | None, saved: str
+) -> None:
+    if origin != expected_origin:
+        raise RequestRejected("origin mismatch")
+    if supplied is None or not hmac.compare_digest(supplied, saved):
+        raise RequestRejected("csrf token mismatch")
+
+
+def session_cookie(*, production: bool) -> dict[str, object]:
+    return {
+        "key": "__Host-temis_session" if production else "temis_session",
+        "httponly": True,
+        "secure": production,
+        "samesite": "lax",
+        "path": "/",
+    }
+
+
+=========================================
+=== File: ./src/temis_bff/sessions.py ===
+=========================================
+
+import hashlib
+import json
+import secrets
+from dataclasses import asdict, dataclass
+
+from redis.asyncio import Redis
+
+
+def _digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BffSession:
+    user_id: str
+    access_token: str
+    refresh_token: str
+    csrf_token: str
+
+
+class RedisSessionStore:
+    def __init__(self, redis_url: str, ttl_seconds: int = 3600) -> None:
+        self.redis_url = redis_url
+        self.ttl_seconds = ttl_seconds
+
+    async def create(self, user_id: str, access_token: str, refresh_token: str) -> str:
+        session_id = secrets.token_urlsafe(32)
+        session = BffSession(user_id, access_token, refresh_token, secrets.token_urlsafe(24))
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            await redis.set(
+                f"temis-bff:session:{_digest(session_id)}",
+                json.dumps(asdict(session)),
+                ex=self.ttl_seconds,
+            )
+        return session_id
+
+    async def get(self, session_id: str) -> BffSession | None:
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            raw = await redis.get(f"temis-bff:session:{_digest(session_id)}")
+        return None if raw is None else BffSession(**json.loads(raw))
+
+    async def delete(self, session_id: str) -> None:
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            await redis.delete(f"temis-bff:session:{_digest(session_id)}")
+
+
+=========================================
+=== File: ./src/temis_bff/__init__.py ===
+=========================================
+
+"""Server-side Backend-for-Frontend used by the TEMIS learning lab."""
+
+
+=========================================
+=== File: ./src/temis_sso/api/admin.py ===
+=========================================
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from temis_sso.api.users import current_subject
+from temis_sso.application.admin import (
+    AdminRequiredError,
+    SelfActionError,
+    UserNotFoundError,
+    approve_user,
+    change_role,
+    revoke_sessions,
+    suspend_user,
+)
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+class UserResult(BaseModel):
+    user_id: str
+    status: str
+
+
+class SuspensionInput(BaseModel):
+    reason: str = Field(min_length=3, max_length=200)
+
+
+def translate(error: Exception) -> HTTPException:
+    if isinstance(error, AdminRequiredError):
+        return HTTPException(status.HTTP_403_FORBIDDEN, "current admin role required")
+    if isinstance(error, SelfActionError):
+        return HTTPException(status.HTTP_409_CONFLICT, "self action is not allowed")
+    return HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+
+
+@router.post("/users/{target_id}/approve", response_model=UserResult)
+async def approve(target_id: str, actor_id: Annotated[str, Depends(current_subject)]) -> UserResult:
+    try:
+        user = await approve_user(actor_id, target_id)
+        return UserResult(user_id=user.id, status=user.status)
+    except (AdminRequiredError, SelfActionError, UserNotFoundError) as error:
+        raise translate(error) from error
+
+
+@router.post("/users/{target_id}/suspend", response_model=UserResult)
+async def suspend(
+    target_id: str,
+    payload: SuspensionInput,
+    actor_id: Annotated[str, Depends(current_subject)],
+) -> UserResult:
+    try:
+        user = await suspend_user(actor_id, target_id, payload.reason)
+        return UserResult(user_id=user.id, status=user.status)
+    except (AdminRequiredError, SelfActionError, UserNotFoundError) as error:
+        raise translate(error) from error
+
+
+@router.put("/users/{target_id}/roles/{role}", status_code=status.HTTP_204_NO_CONTENT)
+async def grant_role(
+    target_id: str, role: str, actor_id: Annotated[str, Depends(current_subject)]
+) -> None:
+    try:
+        await change_role(actor_id, target_id, role, True)
+    except (AdminRequiredError, SelfActionError, UserNotFoundError) as error:
+        raise translate(error) from error
+
+
+@router.delete("/users/{target_id}/roles/{role}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_role(
+    target_id: str, role: str, actor_id: Annotated[str, Depends(current_subject)]
+) -> None:
+    try:
+        await change_role(actor_id, target_id, role, False)
+    except (AdminRequiredError, SelfActionError, UserNotFoundError) as error:
+        raise translate(error) from error
+
+
+@router.post("/users/{target_id}/revoke-sessions", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke(target_id: str, actor_id: Annotated[str, Depends(current_subject)]) -> None:
+    try:
+        await revoke_sessions(actor_id, target_id)
+    except (AdminRequiredError, SelfActionError, UserNotFoundError) as error:
+        raise translate(error) from error
+
+
+=========================================
+=== File: ./src/temis_sso/api/auth.py ===
+=========================================
+
+from typing import Annotated
+
+from fastapi import APIRouter, Header, HTTPException, status
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select
+
+from temis_sso.application.auth import (
+    DuplicateEmailError,
+    InvalidCredentialsError,
+    InvalidOneTimeTokenError,
+    VerificationRequiredError,
+    authenticate,
+    register,
+    request_password_reset,
+    reset_password,
+    verify_email,
+)
+from temis_sso.config import settings
+from temis_sso.persistence import User, UserRole, session_scope
+from temis_sso.tokens import codec, issue_refresh, revoke_refresh, rotate_refresh
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+class Credentials(BaseModel):
+    email: str
+    password: str = Field(min_length=12, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        if "@" not in value or len(value) > 320:
+            raise ValueError("valid email required")
+        return value
+
+
+class Identity(BaseModel):
+    user_id: str
+    email: str
+
+
+class TokenBundle(BaseModel):
+    user_id: str
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class TokenInput(BaseModel):
+    token: str
+
+
+class RefreshInput(BaseModel):
+    refresh_token: str
+
+
+class ResetRequest(BaseModel):
+    email: str
+
+
+class ResetConfirm(TokenInput):
+    password: str = Field(min_length=12, max_length=128)
+
+
+class StatusInput(BaseModel):
+    user_id: str
+    authz_version: int
+
+
+class StatusResult(BaseModel):
+    active: bool
+    authz_version: int | None
+
+
+async def issue_bundle(
+    user_id: str, audience: str = "temis-lab", refresh_token: str | None = None
+) -> TokenBundle:
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None or user.status != "active":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "active user required")
+        roles = list(
+            await session.scalars(select(UserRole.role).where(UserRole.user_id == user_id))
+        )
+        scopes = ["profile:read", "reports:read"]
+        if "admin" in roles:
+            scopes.append("admin:write")
+        refresh = refresh_token or await issue_refresh(session, user_id, audience)
+        access = codec.issue_access(
+            user_id,
+            roles=[f"temis:{role}" for role in roles],
+            audience=audience,
+            scopes=scopes,
+            authz_version=user.authz_version,
+        )
+    return TokenBundle(user_id=user_id, access_token=access, refresh_token=refresh)
+
+
+@router.post("/status", response_model=StatusResult)
+async def authorization_status(
+    payload: StatusInput,
+    service_key: Annotated[str | None, Header(alias="X-Status-Key")] = None,
+) -> StatusResult:
+    if service_key != settings.status_service_key:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "service authentication required")
+    async with session_scope() as session:
+        user = await session.get(User, payload.user_id)
+        if user is None:
+            return StatusResult(active=False, authz_version=None)
+        return StatusResult(
+            active=user.status == "active" and user.authz_version == payload.authz_version,
+            authz_version=user.authz_version,
+        )
+
+
+@router.post("/register", response_model=Identity, status_code=status.HTTP_201_CREATED)
+async def register_user(payload: Credentials) -> Identity:
+    try:
+        return Identity.model_validate(
+            await register(payload.email, payload.password), from_attributes=True
+        )
+    except DuplicateEmailError as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered") from error
+
+
+@router.post("/verify", status_code=status.HTTP_204_NO_CONTENT)
+async def confirm_email(payload: TokenInput) -> None:
+    try:
+        await verify_email(payload.token)
+    except InvalidOneTimeTokenError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired token") from error
+
+
+@router.post("/password-reset/request", status_code=status.HTTP_202_ACCEPTED)
+async def reset_request(payload: ResetRequest) -> dict[str, str]:
+    await request_password_reset(payload.email)
+    return {"status": "accepted"}
+
+
+@router.post("/password-reset/confirm", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_confirm(payload: ResetConfirm) -> None:
+    try:
+        await reset_password(payload.token, payload.password)
+    except InvalidOneTimeTokenError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired token") from error
+
+
+@router.post("/login", response_model=TokenBundle)
+async def login(payload: Credentials) -> TokenBundle:
+    try:
+        return await issue_bundle((await authenticate(payload.email, payload.password)).user_id)
+    except VerificationRequiredError as error:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "email verification required") from error
+    except InvalidCredentialsError as error:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials") from error
+
+
+@router.post("/refresh", response_model=TokenBundle)
+async def refresh(payload: RefreshInput) -> TokenBundle:
+    async with session_scope() as session:
+        rotated = await rotate_refresh(session, payload.refresh_token)
+    if rotated is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid refresh token")
+    user_id, audience, new_refresh = rotated
+    return await issue_bundle(user_id, audience, new_refresh)
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(payload: RefreshInput) -> None:
+    async with session_scope() as session:
+        await revoke_refresh(session, payload.refresh_token)
+
+
+=========================================
+=== File: ./src/temis_sso/api/oauth.py ===
+=========================================
+
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
+
+from temis_sso.api.auth import TokenBundle, issue_bundle
+from temis_sso.client_policy import client_by_id, require_client
+from temis_sso.fake_provider import FakeOAuthProvider
+from temis_sso.oauth_state import OAuthTransaction, pkce_challenge, state_store
+from temis_sso.persistence import UserRepository, UserRole, session_scope
+
+router = APIRouter(prefix="/oauth", tags=["oauth"])
+provider = FakeOAuthProvider(state_store)
+
+
+class TokenRequest(BaseModel):
+    grant_type: str
+    client_id: str
+    redirect_uri: str
+    code: str
+    code_verifier: str = Field(min_length=43, max_length=128)
+
+
+async def _oauth_user(provider_subject: str, default_role: str) -> str:
+    email = f"{provider_subject}@oauth.lab.invalid"
+    async with session_scope() as session:
+        repository = UserRepository(session)
+        user = await repository.by_email(email)
+        if user is None:
+            user = await repository.create(email)
+            user.status = "active"
+            session.add(UserRole(user_id=user.id, role=default_role))
+        return user.id
+
+
+@router.get("/authorize")
+async def authorize(
+    client_id: str,
+    redirect_uri: str,
+    state: str = Query(min_length=16, max_length=256),
+    response_type: str = "code",
+    code_challenge: str = Query(min_length=43, max_length=128),
+    code_challenge_method: str = "S256",
+) -> RedirectResponse:
+    if response_type != "code" or code_challenge_method != "S256":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "authorization code with S256 required")
+    try:
+        require_client(client_id, redirect_uri)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
+    provider_state = await state_store.begin(
+        OAuthTransaction(client_id, redirect_uri, code_challenge, "lab-provider", state)
+    )
+    return RedirectResponse(
+        f"/oauth/fake-provider/authorize?{urlencode({'state': provider_state})}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get("/fake-provider/authorize")
+async def fake_authorize(state: str, account: str = "learner") -> RedirectResponse:
+    try:
+        provider_code = await provider.authorize(state, account)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
+    query = urlencode({"state": state, "code": provider_code})
+    return RedirectResponse(
+        f"/oauth/provider/callback?{query}", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+@router.get("/provider/callback")
+async def provider_callback(state: str, code: str) -> RedirectResponse:
+    transaction = await state_store.consume_oauth(state)
+    provider_result = await provider.exchange(code)
+    if (
+        transaction is None
+        or provider_result is None
+        or provider_result["state"] != state
+        or provider_result["provider"] != transaction.provider
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid oauth transaction")
+    policy = require_client(transaction.client_id, transaction.redirect_uri)
+    user_id = await _oauth_user(provider_result["provider_subject"], policy.default_role)
+    auth_code = await state_store.put(
+        "authorization-code",
+        {
+            "user_id": user_id,
+            "client_id": policy.client_id,
+            "redirect_uri": transaction.redirect_uri,
+            "code_challenge": transaction.code_challenge,
+        },
+        60,
+    )
+    query = urlencode({"code": auth_code, "state": transaction.client_state})
+    return RedirectResponse(
+        f"{transaction.redirect_uri}?{query}", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+@router.post("/token", response_model=TokenBundle)
+async def token(request: Request, response: Response) -> TokenBundle:
+    from urllib.parse import parse_qs
+
+    form = parse_qs((await request.body()).decode(), strict_parsing=True)
+    try:
+        payload = TokenRequest(**{key: values[0] for key, values in form.items()})
+    except (ValueError, KeyError) as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid token request") from error
+    grant = await state_store.take("authorization-code", payload.code)
+    valid = (
+        payload.grant_type == "authorization_code"
+        and grant is not None
+        and grant["client_id"] == payload.client_id
+        and grant["redirect_uri"] == payload.redirect_uri
+        and pkce_challenge(payload.code_verifier) == grant["code_challenge"]
+    )
+    if not valid or grant is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid authorization code")
+    policy = client_by_id(payload.client_id)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return await issue_bundle(grant["user_id"], policy.audience)
+
+
+
+=========================================
+=== File: ./src/temis_sso/api/system.py ===
+=========================================
+
+from fastapi import APIRouter, Request
+
+from temis_sso.bootstrap import LabError
+from temis_sso.tokens import codec
+
+router = APIRouter(tags=["system"])
+
+
+@router.get("/healthz")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+def ready(request: Request) -> dict[str, str]:
+    if not request.app.state.ready:
+        raise LabError(503, "not_ready")
+    return {"status": "ready"}
+
+
+@router.get("/.well-known/jwks.json")
+def jwks() -> dict[str, list[dict[str, str]]]:
+    return codec.jwks()
+
+
+=========================================
+=== File: ./src/temis_sso/api/users.py ===
+=========================================
+
+from typing import Annotated
+
+import jwt
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import BaseModel
+
+from temis_sso.persistence import UserRepository, session_scope
+from temis_sso.tokens import codec
+
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+class CurrentUser(BaseModel):
+    user_id: str
+
+
+def current_subject(authorization: Annotated[str | None, Header()] = None) -> str:
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bearer token required")
+    try:
+        return str(codec.verify_access(authorization.removeprefix("Bearer "))["sub"])
+    except jwt.PyJWTError as error:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid access token") from error
+
+
+@router.get("/me", response_model=CurrentUser)
+async def me(user_id: Annotated[str, Depends(current_subject)]) -> CurrentUser:
+    async with session_scope() as session:
+        user = await UserRepository(session).by_id(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+        if user.status != "active":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "user is not active")
+    return CurrentUser(user_id=user_id)
+
+
+=========================================
+=== File: ./src/temis_sso/api/__init__.py ===
+=========================================
+
+"""HTTP route modules."""
+
+
+=========================================
+=== File: ./src/temis_sso/application/admin.py ===
+=========================================
+
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import delete, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from temis_sso.persistence import AuditLog, RefreshGrant, User, UserRole, session_scope
+
+
+class AdminRequiredError(Exception):
+    pass
+
+
+class UserNotFoundError(Exception):
+    pass
+
+
+class SelfActionError(Exception):
+    pass
+
+
+def redact(details: dict[str, Any]) -> dict[str, Any]:
+    hidden = ("password", "token", "secret", "authorization")
+    sanitized: dict[str, Any] = {}
+    for key, value in details.items():
+        sensitive_key = any(word in key.lower() for word in hidden)
+        sensitive_value = isinstance(value, str) and any(
+            marker in value.lower() for marker in ("bearer ", "token=", "password=")
+        )
+        sanitized[key] = "[REDACTED]" if sensitive_key or sensitive_value else value
+    return sanitized
+
+
+async def _assert_admin(session: AsyncSession, actor_id: str) -> User:
+    actor = await session.get(User, actor_id)
+    role = await session.get(UserRole, {"user_id": actor_id, "role": "admin"})
+    if actor is None or actor.status != "active" or role is None:
+        raise AdminRequiredError
+    return actor
+
+
+async def _audit(
+    session: AsyncSession,
+    actor_id: str,
+    target_id: str,
+    action: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    session.add(
+        AuditLog(
+            actor_id=actor_id, target_id=target_id, action=action, details=redact(details or {})
+        )
+    )
+
+
+async def _invalidate_authorization(session: AsyncSession, target: User) -> None:
+    target.authz_version += 1
+    await session.execute(
+        update(RefreshGrant)
+        .where(RefreshGrant.user_id == target.id, RefreshGrant.consumed_at.is_(None))
+        .values(consumed_at=datetime.now(UTC))
+    )
+
+
+async def bootstrap_admin(user_id: str) -> None:
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise UserNotFoundError
+        user.status = "active"
+        await session.merge(UserRole(user_id=user_id, role="admin"))
+        await _invalidate_authorization(session, user)
+
+
+async def approve_user(actor_id: str, target_id: str, fail_for_test: bool = False) -> User:
+    async with session_scope() as session:
+        await _assert_admin(session, actor_id)
+        target = await session.get(User, target_id, with_for_update=True)
+        if target is None:
+            raise UserNotFoundError
+        target.status = "active"
+        await session.execute(
+            delete(UserRole).where(UserRole.user_id == target_id, UserRole.role == "pending")
+        )
+        await session.merge(UserRole(user_id=target_id, role="user"))
+        await _invalidate_authorization(session, target)
+        await _audit(session, actor_id, target_id, "user.approved")
+        if fail_for_test:
+            raise RuntimeError("simulated audit boundary failure")
+        await session.flush()
+        return target
+
+
+async def suspend_user(actor_id: str, target_id: str, reason: str) -> User:
+    if actor_id == target_id:
+        raise SelfActionError
+    async with session_scope() as session:
+        await _assert_admin(session, actor_id)
+        target = await session.get(User, target_id, with_for_update=True)
+        if target is None:
+            raise UserNotFoundError
+        target.status = "suspended"
+        await _invalidate_authorization(session, target)
+        await _audit(session, actor_id, target_id, "user.suspended", {"reason": reason})
+        return target
+
+
+async def change_role(actor_id: str, target_id: str, role: str, grant: bool) -> None:
+    if actor_id == target_id and role == "admin" and not grant:
+        raise SelfActionError
+    async with session_scope() as session:
+        await _assert_admin(session, actor_id)
+        target = await session.get(User, target_id, with_for_update=True)
+        if target is None:
+            raise UserNotFoundError
+        if grant:
+            await session.merge(UserRole(user_id=target_id, role=role))
+            action = "role.granted"
+        else:
+            await session.execute(
+                delete(UserRole).where(UserRole.user_id == target_id, UserRole.role == role)
+            )
+            action = "role.revoked"
+        await _invalidate_authorization(session, target)
+        await _audit(session, actor_id, target_id, action, {"role": role})
+
+
+async def revoke_sessions(actor_id: str, target_id: str) -> None:
+    if actor_id == target_id:
+        raise SelfActionError
+    async with session_scope() as session:
+        await _assert_admin(session, actor_id)
+        target = await session.get(User, target_id, with_for_update=True)
+        if target is None:
+            raise UserNotFoundError
+        await _invalidate_authorization(session, target)
+        await _audit(session, actor_id, target_id, "sessions.revoked")
+
+
+async def require_current_admin(user_id: str) -> None:
+    async with session_scope() as session:
+        await _assert_admin(session, user_id)
+
+
+=========================================
+=== File: ./src/temis_sso/application/auth.py ===
+=========================================
+
+import hashlib
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from temis_sso.persistence import OneTimeToken, UserRepository, session_scope
+from temis_sso.security import hash_password, verify_password
+
+
+class DuplicateEmailError(Exception):
+    pass
+
+
+class InvalidCredentialsError(Exception):
+    pass
+
+
+class VerificationRequiredError(Exception):
+    pass
+
+
+class InvalidOneTimeTokenError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    user_id: str
+    email: str
+
+
+mailbox: dict[tuple[str, str], str] = {}
+
+
+def _digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _issue_one_time(user_id: str, email: str, purpose: str) -> None:
+    raw = secrets.token_urlsafe(32)
+    async with session_scope() as session:
+        session.add(
+            OneTimeToken(
+                digest=_digest(raw),
+                user_id=user_id,
+                purpose=purpose,
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+            )
+        )
+    mailbox[(email, purpose)] = raw
+
+
+async def register(email: str, password: str) -> AuthenticatedUser:
+    try:
+        async with session_scope() as session:
+            user = await UserRepository(session).create(email, hash_password(password))
+            identity = AuthenticatedUser(user.id, user.email)
+        await _issue_one_time(identity.user_id, identity.email, "verify")
+        return identity
+    except IntegrityError as error:
+        raise DuplicateEmailError from error
+
+
+async def authenticate(email: str, password: str) -> AuthenticatedUser:
+    outcome: AuthenticatedUser | None = None
+    error: Exception | None = None
+    async with session_scope() as session:
+        user = await UserRepository(session).by_email(email)
+        now = datetime.now(UTC)
+        if (
+            user is None
+            or user.password_hash is None
+            or user.locked_until
+            and user.locked_until > now
+        ):
+            error = InvalidCredentialsError()
+        elif not verify_password(user.password_hash, password):
+            user.failed_logins += 1
+            if user.failed_logins >= 3:
+                user.locked_until = now + timedelta(minutes=5)
+            error = InvalidCredentialsError()
+        elif user.status == "pending":
+            error = VerificationRequiredError()
+        elif user.status != "active":
+            error = InvalidCredentialsError()
+        else:
+            user.failed_logins = 0
+            user.locked_until = None
+            outcome = AuthenticatedUser(user.id, user.email)
+    if error:
+        raise error
+    assert outcome is not None
+    return outcome
+
+
+async def consume_one_time(raw: str, purpose: str) -> str:
+    async with session_scope() as session:
+        token = await session.scalar(
+            select(OneTimeToken)
+            .where(OneTimeToken.digest == _digest(raw), OneTimeToken.purpose == purpose)
+            .with_for_update()
+        )
+        if token is None or token.consumed_at is not None or token.expires_at <= datetime.now(UTC):
+            raise InvalidOneTimeTokenError
+        token.consumed_at = datetime.now(UTC)
+        return token.user_id
+
+
+async def verify_email(raw: str) -> None:
+    user_id = await consume_one_time(raw, "verify")
+    async with session_scope() as session:
+        user = await UserRepository(session).by_id(user_id)
+        if user is None:
+            raise InvalidOneTimeTokenError
+        user.status = "active"
+
+
+async def request_password_reset(email: str) -> None:
+    async with session_scope() as session:
+        user = await UserRepository(session).by_email(email)
+        identity = None if user is None else AuthenticatedUser(user.id, user.email)
+    if identity:
+        await _issue_one_time(identity.user_id, identity.email, "reset")
+
+
+async def reset_password(raw: str, password: str) -> None:
+    user_id = await consume_one_time(raw, "reset")
+    async with session_scope() as session:
+        user = await UserRepository(session).by_id(user_id)
+        if user is None:
+            raise InvalidOneTimeTokenError
+        user.password_hash = hash_password(password)
+        user.failed_logins = 0
+        user.locked_until = None
+
+
+=========================================
+=== File: ./src/temis_sso/application/users.py ===
+=========================================
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class UserProfile:
+    user_id: str
+    email: str
+
+
+class UserDirectory:
+    def __init__(self) -> None:
+        self._users = {"learner-001": UserProfile("learner-001", "learner@lab.invalid")}
+
+    def by_id(self, user_id: str) -> UserProfile | None:
+        return self._users.get(user_id)
+
+
+=========================================
+=== File: ./src/temis_sso/application/__init__.py ===
+=========================================
+
+"""Application use cases."""
+
+
+=========================================
+=== File: ./src/temis_sso/bootstrap.py ===
+=========================================
+
+from collections.abc import Awaitable, Callable
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.responses import Response
+
+
+class LabError(Exception):
+    def __init__(self, status_code: int, code: str) -> None:
+        self.status_code = status_code
+        self.code = code
+
+
+def configure_app(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
+
+    @app.exception_handler(LabError)
+    async def lab_error(_: Request, error: LabError) -> JSONResponse:
+        return JSONResponse({"error": {"code": error.code}}, status_code=error.status_code)
+
+
+=========================================
+=== File: ./src/temis_sso/client_policy.py ===
+=========================================
+
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+
+@dataclass(frozen=True)
+class ClientPolicy:
+    client_id: str
+    audience: str
+    redirect_uris: frozenset[str]
+    cors_origins: frozenset[str]
+    default_role: str
+
+    def permits_redirect(self, redirect_uri: str) -> bool:
+        return redirect_uri in self.redirect_uris
+
+
+def _origin(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("absolute HTTP URL required")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+clients = {
+    "temis-web": ClientPolicy(
+        client_id="temis-web",
+        audience="temis-lab",
+        redirect_uris=frozenset({"http://localhost:3000/auth/callback"}),
+        cors_origins=frozenset({_origin("http://localhost:3000")}),
+        default_role="user",
+    )
+}
+
+
+def require_client(client_id: str, redirect_uri: str) -> ClientPolicy:
+    client = clients.get(client_id)
+    if client is None:
+        raise ValueError("unknown client")
+    if not client.permits_redirect(redirect_uri):
+        raise ValueError("redirect URI is not allowed")
+    return client
+
+
+def client_by_id(client_id: str) -> ClientPolicy:
+    client = clients.get(client_id)
+    if client is None:
+        raise ValueError("unknown client")
+    return client
+
+
+def allowed_origins() -> list[str]:
+    return sorted({origin for client in clients.values() for origin in client.cors_origins})
+
+
+=========================================
+=== File: ./src/temis_sso/config.py ===
+=========================================
+
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="TEMIS_LAB_")
+
+    database_url: str = "postgresql+asyncpg://temis_lab@127.0.0.1:55439/temis_sso_lab"
+    redis_url: str = "redis://127.0.0.1:56389/0"
+    private_key_path: Path = Path("var/keys/access-private.pem")
+    public_key_path: Path = Path("var/keys/access-public.pem")
+    status_service_key: str = "local-learning-status-key"
+    service_name: str = "TEMIS SSO Lab"
+    debug: bool = False
+
+    google_client_id: str
+    google_client_secret: str
+
+
+settings = Settings()
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/callback.py ===
+=========================================
+
+import re
+from typing import Any
+
+import httpx
+import jwt
+from jwt.exceptions import InvalidAudienceError, InvalidIssuerError, InvalidTokenError
+
+from temis_sso.external_idp.external_accounts import ExternalIdentityLinkRepository
+from temis_sso.external_idp.google import GoogleOidcAdapter
+from temis_sso.external_idp.models import ExternalIdentity, ProviderMetadata
+from temis_sso.external_idp.security import FlowStore
+from temis_sso.external_idp.sessions import SessionStore
+
+
+class JwksCache:
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[int, list[dict[str, Any]]]] = {}
+
+    async def _refresh(
+        self, metadata: ProviderMetadata, http: httpx.AsyncClient, now: int
+    ) -> list[dict[str, Any]]:
+        response = await http.get(metadata.jwks_uri)
+        response.raise_for_status()
+        keys = [item for item in response.json().get("keys", []) if isinstance(item, dict)]
+        match = re.search(r"(?:^|,)\s*max-age=(\d+)", response.headers.get("Cache-Control", ""))
+        ttl = int(match.group(1)) if match else 0
+        self._entries[metadata.jwks_uri] = (now + ttl, keys)
+        return keys
+
+    async def key(
+        self,
+        metadata: ProviderMetadata,
+        http: httpx.AsyncClient,
+        kid: str,
+        now: int,
+    ) -> dict[str, Any]:
+        entry = self._entries.get(metadata.jwks_uri)
+        cache_is_fresh = entry is not None and now < entry[0]
+        if entry is not None and cache_is_fresh:
+            keys = entry[1]
+        else:
+            keys = await self._refresh(metadata, http, now)
+        key = next((item for item in keys if item.get("kid") == kid), None)
+        if key is None and cache_is_fresh:
+            keys = await self._refresh(metadata, http, now)
+            key = next((item for item in keys if item.get("kid") == kid), None)
+        if key is None:
+            raise ValueError("ID token signing key is unknown")
+        return key
+
+
+async def verify_google_id_token(
+    encoded: str,
+    metadata: ProviderMetadata,
+    http: httpx.AsyncClient,
+    audience: str,
+    expected_nonce: str,
+    cache: JwksCache,
+    now: int,
+) -> ExternalIdentity:
+    header = jwt.get_unverified_header(encoded)
+    if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+        raise ValueError("ID token algorithm or kid is invalid")
+    jwk = await cache.key(metadata, http, header["kid"], now)
+    try:
+        claims: dict[str, Any] = jwt.decode(
+            encoded,
+            jwt.PyJWK.from_dict(jwk).key,
+            algorithms=["RS256"],
+            audience=audience,
+            issuer=metadata.issuer,
+            options={"require": ["exp", "iat", "iss", "aud", "sub", "nonce"]},
+        )
+    except InvalidIssuerError as error:
+        raise ValueError("ID token issuer mismatch") from error
+    except InvalidAudienceError as error:
+        raise ValueError("ID token audience mismatch") from error
+    except InvalidTokenError as error:
+        raise ValueError("invalid ID token") from error
+    if claims.get("nonce") != expected_nonce:
+        raise ValueError("ID token nonce mismatch")
+    if isinstance(claims.get("aud"), list) and claims.get("azp") != audience:
+        raise ValueError("ID token authorized party mismatch")
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject:
+        raise ValueError("ID token subject is missing")
+    email = claims.get("email")
+    return ExternalIdentity(
+        "google",
+        subject,
+        email if isinstance(email, str) else None,
+        claims.get("email_verified") is True,
+    )
+
+
+class GoogleCallbackService:
+    def __init__(
+        self,
+        adapter: GoogleOidcAdapter,
+        flows: FlowStore,
+        links: ExternalIdentityLinkRepository,
+        sessions: SessionStore,
+        http: httpx.AsyncClient,
+        jwks: JwksCache,
+    ) -> None:
+        self.adapter = adapter
+        self.flows = flows
+        self.links = links
+        self.sessions = sessions
+        self.http = http
+        self.jwks = jwks
+
+    async def finish_callback(self, state: str, code: str, now: int, browser_binding: str) -> str:
+        flow = self.flows.consume(state, now, browser_binding)
+        metadata = await self.adapter.discover()
+        encoded = await self.adapter.exchange_code(metadata, code, flow)
+        identity = await verify_google_id_token(
+            encoded,
+            metadata,
+            self.http,
+            self.adapter.client_id,
+            flow.nonce,
+            self.jwks,
+            now,
+        )
+        user_id = await self.links.resolve(identity.provider, identity.subject)
+        if user_id is None:
+            raise ValueError("external identity is not linked")
+        return self.sessions.issue(user_id)
+
+    async def revoke(self, metadata: ProviderMetadata, provider_token: str) -> bool:
+        response = await self.http.post(
+            metadata.revocation_endpoint, data={"token": provider_token}
+        )
+        return response.is_success
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/external_accounts.py ===
+=========================================
+
+from datetime import UTC, datetime
+from typing import cast
+
+from sqlalchemy import DateTime, ForeignKey, String, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Mapped, mapped_column
+
+from temis_sso.external_idp.models import ExternalIdentity
+from temis_sso.persistence import Base
+
+
+class ExternalIdentityLink(Base):
+    __tablename__ = "external_identity_links"
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class ExternalIdentityLinkRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def _insert(self, provider: str, subject: str, user_id: str) -> None:
+        self.session.add(ExternalIdentityLink(provider=provider, subject=subject, user_id=user_id))
+        await self.session.flush()
+
+    async def resolve(self, provider: str, subject: str) -> str | None:
+        statement = select(ExternalIdentityLink.user_id).where(
+            ExternalIdentityLink.provider == provider,
+            ExternalIdentityLink.subject == subject,
+        )
+        return cast(str | None, await self.session.scalar(statement))
+
+
+class ConfirmedAccountLinkService:
+    def __init__(self, repository: ExternalIdentityLinkRepository) -> None:
+        self.repository = repository
+
+    async def link(
+        self,
+        authenticated_user_id: str,
+        identity: ExternalIdentity,
+        *,
+        confirmed: bool,
+    ) -> None:
+        if not authenticated_user_id:
+            raise ValueError("authenticated user is required")
+        if not confirmed:
+            raise ValueError("account linking requires explicit confirmation")
+        await self.repository._insert(identity.provider, identity.subject, authenticated_user_id)
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/google.py ===
+=========================================
+
+import httpx
+
+from temis_sso.external_idp.models import (
+    AuthorizationRequest,
+    ExternalFlow,
+    ProviderMetadata,
+)
+
+
+class GoogleOidcAdapter:
+    discovery_url = "https://accounts.google.com/.well-known/openid-configuration"
+    expected_issuer = "https://accounts.google.com"
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        http: httpx.AsyncClient,
+    ) -> None:
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.http = http
+
+    async def discover(self) -> ProviderMetadata:
+        response = await self.http.get(self.discovery_url)
+        response.raise_for_status()
+        metadata = ProviderMetadata(**response.json())
+        if metadata.issuer != self.expected_issuer:
+            raise ValueError("discovery issuer mismatch")
+        return metadata
+
+    def authorization_request(
+        self, metadata: ProviderMetadata, flow: ExternalFlow
+    ) -> AuthorizationRequest:
+        return AuthorizationRequest(
+            url=metadata.authorization_endpoint,
+            parameters={
+                "client_id": self.client_id,
+                "redirect_uri": flow.redirect_uri,
+                "response_type": "code",
+                "scope": "openid email profile",
+                "state": flow.state,
+                "nonce": flow.nonce,
+                "code_challenge": flow.code_challenge,
+                "code_challenge_method": "S256",
+            },
+        )
+
+    async def exchange_code(self, metadata: ProviderMetadata, code: str, flow: ExternalFlow) -> str:
+        response = await self.http.post(
+            metadata.token_endpoint,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": flow.redirect_uri,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "code_verifier": flow.code_verifier,
+            },
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+        if "no-store" not in response.headers.get("Cache-Control", "").lower():
+            raise ValueError("token response must be marked no-store")
+        payload = response.json()
+        token = payload.get("id_token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("token response is missing id_token")
+        return token
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/models.py ===
+=========================================
+
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+
+def _require_https(value: str) -> None:
+    if urlparse(value).scheme != "https":
+        raise ValueError("provider endpoints must use HTTPS")
+
+
+@dataclass(frozen=True)
+class ProviderMetadata:
+    issuer: str
+    authorization_endpoint: str
+    token_endpoint: str
+    userinfo_endpoint: str
+    revocation_endpoint: str
+    jwks_uri: str
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.issuer,
+            self.authorization_endpoint,
+            self.token_endpoint,
+            self.userinfo_endpoint,
+            self.revocation_endpoint,
+            self.jwks_uri,
+        ):
+            _require_https(value)
+
+
+@dataclass(frozen=True)
+class ExternalFlow:
+    state: str
+    nonce: str
+    code_verifier: str
+    code_challenge: str
+    redirect_uri: str
+    created_at: int
+    browser_binding: str
+
+
+@dataclass(frozen=True)
+class AuthorizationRequest:
+    url: str
+    parameters: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ExternalIdentity:
+    provider: str
+    subject: str
+    email: str | None
+    email_verified: bool
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/security.py ===
+=========================================
+
+import hashlib
+import re
+import secrets
+from base64 import urlsafe_b64encode
+
+from temis_sso.external_idp.models import ExternalFlow
+
+
+def _token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _s256(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+class FlowStore:
+    def __init__(self, ttl_seconds: int = 300) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._flows: dict[str, ExternalFlow] = {}
+
+    def issue(self, redirect_uri: str, now: int, browser_binding: str) -> ExternalFlow:
+        if re.fullmatch(r"[A-Za-z0-9_-]{16,128}", browser_binding) is None:
+            raise ValueError("browser binding format is invalid")
+        verifier = _token()
+        flow = ExternalFlow(
+            state=_token(),
+            nonce=_token(),
+            code_verifier=verifier,
+            code_challenge=_s256(verifier),
+            redirect_uri=redirect_uri,
+            created_at=now,
+            browser_binding=browser_binding,
+        )
+        self._flows[flow.state] = flow
+        return flow
+
+    def consume(self, state: str, now: int, browser_binding: str) -> ExternalFlow:
+        if re.fullmatch(r"[A-Za-z0-9_-]{16,128}", browser_binding) is None:
+            raise ValueError("browser binding format is invalid")
+        flow = self._flows.get(state)
+        if flow is None:
+            raise ValueError("unknown or already used state")
+        if now - flow.created_at > self.ttl_seconds:
+            raise ValueError("expired state")
+        if flow.browser_binding != browser_binding:
+            raise ValueError("state browser binding mismatch")
+        del self._flows[state]
+        return flow
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/sessions.py ===
+=========================================
+
+import secrets
+
+
+class SessionStore:
+    def __init__(self) -> None:
+        self._sessions: dict[str, str] = {}
+
+    def issue(self, user_id: str) -> str:
+        session_id = secrets.token_urlsafe(32)
+        self._sessions[session_id] = user_id
+        return session_id
+
+    def resolve(self, session_id: str) -> str | None:
+        return self._sessions.get(session_id)
+
+    def revoke(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+
+=========================================
+=== File: ./src/temis_sso/external_idp/__init__.py ===
+=========================================
+
+"""External identity-provider contracts used by the learning lab."""
+
+
+=========================================
+=== File: ./src/temis_sso/fake_provider.py ===
+=========================================
+
+from dataclasses import dataclass
+from typing import ClassVar
+
+from temis_sso.oauth_state import RedisOneTimeStore
+
+
+@dataclass(frozen=True)
+class ProviderIdentity:
+    provider: str
+    provider_subject: str
+
+
+class FakeOAuthProvider:
+    accounts: ClassVar[dict[str, ProviderIdentity]] = {
+        "learner": ProviderIdentity("lab-provider", "learner-001"),
+        "reviewer": ProviderIdentity("lab-provider", "reviewer-001"),
+    }
+
+    def __init__(self, store: RedisOneTimeStore) -> None:
+        self.store = store
+
+    async def authorize(self, state: str, account: str) -> str:
+        identity = self.accounts.get(account)
+        if identity is None:
+            raise ValueError("unknown fake-provider account")
+        return await self.store.put(
+            "provider-code",
+            {
+                "state": state,
+                "provider": identity.provider,
+                "provider_subject": identity.provider_subject,
+            },
+            60,
+        )
+
+    async def exchange(self, code: str) -> dict[str, str] | None:
+        return await self.store.take("provider-code", code)
+
+
+=========================================
+=== File: ./src/temis_sso/keygen.py ===
+=========================================
+
+import argparse
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+def generate_key_pair(private_path: Path, public_path: Path, force: bool = False) -> None:
+    if not force and (private_path.exists() or public_path.exists()):
+        raise FileExistsError("key file already exists; refuse to replace signing identity")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    public_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    public_path.write_bytes(
+        key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate persistent lab JWT signing keys")
+    parser.add_argument("--private", type=Path, default=Path("var/keys/access-private.pem"))
+    parser.add_argument("--public", type=Path, default=Path("var/keys/access-public.pem"))
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+    generate_key_pair(args.private, args.public, args.force)
+
+
+if __name__ == "__main__":
+    main()
+
+
+=========================================
+=== File: ./src/temis_sso/keyring.py ===
+=========================================
+
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TypedDict, cast
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+
+
+class KeyRecord(TypedDict):
+    kid: str
+    state: str
+    published_at: float
+    activated_at: float | None
+    retiring_at: float | None
+
+
+def _b64url(value: int) -> str:
+    size = (value.bit_length() + 7) // 8
+    return base64.urlsafe_b64encode(value.to_bytes(size, "big")).rstrip(b"=").decode()
+
+
+class KeyRing:
+    MINIMUM_OVERLAP_SECONDS = 600 + 60 + 300
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        clock: Callable[[], float] = time.time,
+        overlap_seconds: float = 960,
+    ) -> None:
+        self.root = root
+        self.metadata = root / "keyring.json"
+        self.lock_file = root / ".keyring.lock"
+        self.clock = clock
+        if overlap_seconds < self.MINIMUM_OVERLAP_SECONDS:
+            raise ValueError("overlap must cover access TTL, clock skew, and JWKS cache TTL")
+        self.overlap_seconds = overlap_seconds
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self.lock_file.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _records(self) -> list[KeyRecord]:
+        if not self.metadata.exists():
+            return []
+        return cast(list[KeyRecord], json.loads(self.metadata.read_text()))
+
+    def _save(self, records: list[KeyRecord]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self.root, prefix="keyring-", delete=False
+        ) as handle:
+            handle.write(json.dumps(records, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, self.metadata)
+        self.metadata.chmod(0o600)
+        directory = os.open(self.root, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def active_kid(self) -> str:
+        active = next((record for record in self._records() if record["state"] == "active"), None)
+        if active is None:
+            raise RuntimeError("no active signing key")
+        return active["kid"]
+
+    def publish(self) -> str:
+        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public = private.public_key()
+        public_der = public.public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        kid = hashlib.sha256(public_der).hexdigest()[:16]
+        with self._locked():
+            private_path = self.root / f"{kid}.private.pem"
+            public_path = self.root / f"{kid}.public.pem"
+            private_path.write_bytes(
+                private.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+            )
+            private_path.chmod(0o600)
+            public_path.write_bytes(
+                public.public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+            )
+            self._save(
+                [
+                    *self._records(),
+                    {
+                        "kid": kid,
+                        "state": "published",
+                        "published_at": self.clock(),
+                        "activated_at": None,
+                        "retiring_at": None,
+                    },
+                ]
+            )
+        return kid
+
+    def activate(self, kid: str) -> None:
+        with self._locked():
+            records = self._records()
+            target = next((record for record in records if record["kid"] == kid), None)
+            if target is None or target["state"] != "published":
+                raise ValueError("only a published key can be activated")
+            now = self.clock()
+            for record in records:
+                if record["state"] == "active":
+                    record["state"] = "retiring"
+                    record["retiring_at"] = now
+            target["state"] = "active"
+            target["activated_at"] = now
+            self._save(records)
+
+    def retire(self, kid: str) -> None:
+        with self._locked():
+            records = self._records()
+            target = next((record for record in records if record["kid"] == kid), None)
+            if target is None or target["state"] != "retiring":
+                raise ValueError("only a retiring key can be retired")
+            retiring_at = target["retiring_at"]
+            if retiring_at is None or self.clock() - retiring_at < self.overlap_seconds:
+                raise ValueError("verification overlap has not elapsed")
+            target["state"] = "retired"
+            self._save(records)
+
+    def sign_claims(self, claims: dict[str, object]) -> str:
+        active = next((record for record in self._records() if record["state"] == "active"), None)
+        if active is None:
+            raise RuntimeError("no active signing key")
+        loaded = serialization.load_pem_private_key(
+            (self.root / f"{active['kid']}.private.pem").read_bytes(), password=None
+        )
+        if not isinstance(loaded, RSAPrivateKey):
+            raise TypeError("signing key must be RSA")
+        return jwt.encode(claims, loaded, algorithm="RS256", headers={"kid": active["kid"]})
+
+    def sign(self, subject: str, issuer: str, audience: str) -> str:
+        now = datetime.now(UTC)
+        return self.sign_claims(
+            {
+                "sub": subject,
+                "iss": issuer,
+                "aud": audience,
+                "iat": now,
+                "exp": now + timedelta(minutes=10),
+            }
+        )
+
+    def verification_key(self, kid: str) -> RSAPublicKey:
+        record = next(
+            (item for item in self._records() if item["kid"] == kid and item["state"] != "retired"),
+            None,
+        )
+        if record is None:
+            raise ValueError("verification key is not published")
+        loaded = serialization.load_pem_public_key((self.root / f"{kid}.public.pem").read_bytes())
+        if not isinstance(loaded, RSAPublicKey):
+            raise TypeError("verification key must be RSA")
+        return loaded
+
+    def jwks(self) -> dict[str, list[dict[str, str]]]:
+        keys: list[dict[str, str]] = []
+        for record in self._records():
+            if record["state"] == "retired":
+                continue
+            loaded = serialization.load_pem_public_key(
+                (self.root / f"{record['kid']}.public.pem").read_bytes()
+            )
+            if not isinstance(loaded, RSAPublicKey):
+                raise TypeError("verification key must be RSA")
+            numbers = loaded.public_numbers()
+            keys.append(
+                {
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": record["kid"],
+                    "n": _b64url(numbers.n),
+                    "e": _b64url(numbers.e),
+                }
+            )
+        return {"keys": keys}
+
+
+=========================================
+=== File: ./src/temis_sso/main.py ===
+=========================================
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from temis_sso.api.admin import router as admin_router
+from temis_sso.api.auth import router as auth_router
+from temis_sso.api.oauth import router as oauth_router
+from temis_sso.api.system import router as system_router
+from temis_sso.api.users import router as users_router
+from temis_sso.bootstrap import configure_app
+from temis_sso.client_policy import allowed_origins
+from temis_sso.config import settings
+from temis_sso.observability import Metrics, install_observability
+
+metrics = Metrics()
+
+
+def create_app(ready: bool = True, log_sink: list[str] | None = None) -> FastAPI:
+    app = FastAPI(title=settings.service_name, debug=settings.debug, version="0.12.0")
+    app.state.ready = ready
+    configure_app(app)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins(),
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-Status-Key", "X-Request-ID"],
+    )
+    app.include_router(system_router)
+    app.include_router(auth_router)
+    app.include_router(users_router)
+    app.include_router(oauth_router)
+    app.include_router(admin_router)
+    install_observability(app, "sso", metrics, None if log_sink is None else log_sink.append)
+    return app
+
+
+app = create_app()
+
+
+=========================================
+=== File: ./src/temis_sso/oauth_state.py ===
+=========================================
+
+import base64
+import hashlib
+import json
+import secrets
+from dataclasses import asdict, dataclass
+
+from redis.asyncio import Redis
+
+from temis_sso.config import settings
+
+
+def pkce_challenge(verifier: str) -> str:
+    return (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    )
+
+
+def _key(namespace: str, raw: str) -> str:
+    return f"temis-lab:{namespace}:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
+@dataclass(frozen=True)
+class OAuthTransaction:
+    client_id: str
+    redirect_uri: str
+    code_challenge: str
+    provider: str
+    client_state: str
+
+
+class RedisOneTimeStore:
+    def __init__(self, redis_url: str) -> None:
+        self.redis_url = redis_url
+
+    async def put(self, namespace: str, value: dict[str, str], ttl_seconds: int) -> str:
+        raw = secrets.token_urlsafe(32)
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            await redis.set(_key(namespace, raw), json.dumps(value), ex=ttl_seconds)
+        return raw
+
+    async def take(self, namespace: str, raw: str) -> dict[str, str] | None:
+        async with Redis.from_url(self.redis_url, decode_responses=True) as redis:
+            value = await redis.getdel(_key(namespace, raw))
+        return None if value is None else json.loads(value)
+
+    async def begin(self, transaction: OAuthTransaction, ttl_seconds: int = 300) -> str:
+        return await self.put("oauth", asdict(transaction), ttl_seconds)
+
+    async def consume_oauth(self, state: str) -> OAuthTransaction | None:
+        value = await self.take("oauth", state)
+        return None if value is None else OAuthTransaction(**value)
+
+
+state_store = RedisOneTimeStore(settings.redis_url)
+
+
+=========================================
+=== File: ./src/temis_sso/observability.py ===
+=========================================
+
+import json
+import logging
+import time
+from collections import Counter
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
+from uuid import uuid4
+
+from fastapi import FastAPI, Request
+from starlette.responses import Response
+
+SENSITIVE_MARKERS = (
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+    "code",
+    "email",
+)
+SENSITIVE_VALUE_MARKERS = (
+    "bearer ",
+    "token=",
+    "password=",
+    "code=",
+    "refresh_token",
+    "cookie:",
+    "__host-",
+    "session=",
+    "state=",
+    "code_verifier=",
+    "csrf",
+)
+_request_id: ContextVar[str | None] = ContextVar("temis_request_id", default=None)
+
+
+def current_request_id() -> str | None:
+    return _request_id.get()
+
+
+def redact(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]"
+            if any(marker in str(key).lower() for marker in SENSITIVE_MARKERS)
+            else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, str) and any(
+        marker in value.lower() for marker in SENSITIVE_VALUE_MARKERS
+    ):
+        return "[REDACTED]"
+    return value
+
+
+class StructuredLogger:
+    def __init__(self, service: str, sink: Callable[[str], None]) -> None:
+        self.service = service
+        self.sink = sink
+
+    def event(self, name: str, outcome: str, request_id: str, **fields: object) -> None:
+        record = {
+            "service": self.service,
+            "event": name,
+            "outcome": outcome,
+            "request_id": request_id,
+            **fields,
+        }
+        self.sink(json.dumps(redact(record), separators=(",", ":"), sort_keys=True))
+
+
+METRIC_LABELS: dict[str, dict[str, frozenset[str]]] = {
+    "temis_auth_requests_total": {
+        "route": frozenset(
+            {
+                "authorize",
+                "token",
+                "callback",
+                "refresh",
+                "login",
+                "session",
+                "logout",
+                "reports",
+                "other",
+            }
+        ),
+        "outcome": frozenset({"success", "rejected", "error"}),
+    },
+    "temis_dependency_health": {
+        "dependency": frozenset({"postgres", "redis", "jwks"}),
+        "state": frozenset({"up", "down"}),
+    },
+}
+
+
+class Metrics:
+    def __init__(self) -> None:
+        self._values: Counter[tuple[str, tuple[tuple[str, str], ...]]] = Counter()
+
+    def increment(self, name: str, labels: dict[str, str]) -> None:
+        allowed = METRIC_LABELS.get(name)
+        if allowed is None or set(labels) != set(allowed):
+            raise ValueError("unknown metric or label schema")
+        if any(value not in allowed[key] for key, value in labels.items()):
+            raise ValueError("high-cardinality label value")
+        self._values[(name, tuple(sorted(labels.items())))] += 1
+
+    def render(self) -> str:
+        lines = []
+        for (name, labels), value in sorted(self._values.items()):
+            encoded = ",".join(f'{key}="{item}"' for key, item in labels)
+            lines.append(f"{name}{{{encoded}}} {value}")
+        return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _route_name(path: str) -> str:
+    for fragment, name in [
+        ("authorize", "authorize"),
+        ("token", "token"),
+        ("callback", "callback"),
+        ("refresh", "refresh"),
+        ("login", "login"),
+        ("session", "session"),
+        ("logout", "logout"),
+        ("reports", "reports"),
+    ]:
+        if fragment in path:
+            return name
+    return "other"
+
+
+def install_observability(
+    app: FastAPI,
+    service: str,
+    metrics: Metrics,
+    sink: Callable[[str], None] | None = None,
+) -> None:
+    logger = StructuredLogger(service, sink or logging.getLogger(f"temis.{service}").info)
+
+    @app.middleware("http")
+    async def observe(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        supplied = request.headers.get("x-request-id", "")
+        request_id = supplied if supplied.isascii() and 0 < len(supplied) <= 64 else uuid4().hex
+        context_token = _request_id.set(request_id)
+        route = _route_name(request.url.path)
+        started = time.monotonic()
+        try:
+            response = await call_next(request)
+            outcome = "success" if response.status_code < 400 else "rejected"
+        except Exception:
+            metrics.increment("temis_auth_requests_total", {"route": route, "outcome": "error"})
+            logger.event("http.request", "error", request_id, route=route)
+            raise
+        finally:
+            _request_id.reset(context_token)
+        metrics.increment("temis_auth_requests_total", {"route": route, "outcome": outcome})
+        logger.event(
+            "http.request",
+            outcome,
+            request_id,
+            route=route,
+            status=response.status_code,
+            duration_ms=round((time.monotonic() - started) * 1000, 2),
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+=========================================
+=== File: ./src/temis_sso/persistence.py ===
+=========================================
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from typing import Any, cast
+from uuid import uuid4
+
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import NullPool
+
+from temis_sso.config import settings
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    authz_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    failed_logins: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(32), primary_key=True)
+
+
+class RefreshGrant(Base):
+    __tablename__ = "refresh_grants"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    audience: Mapped[str] = mapped_column(String(80))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OneTimeToken(Base):
+    __tablename__ = "one_time_tokens"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    purpose: Mapped[str] = mapped_column(String(24))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    actor_id: Mapped[str] = mapped_column(String(36))
+    target_id: Mapped[str] = mapped_column(String(36))
+    action: Mapped[str] = mapped_column(String(80))
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+engine = create_async_engine(settings.database_url, poolclass=NullPool)
+SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    session = SessionFactory()
+    try:
+        yield session
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
+
+
+class UserRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def create(self, email: str, password_hash: str | None = None) -> User:
+        user = User(email=email.strip().lower(), password_hash=password_hash)
+        self.session.add(user)
+        await self.session.flush()
+        return user
+
+    async def by_email(self, email: str) -> User | None:
+        return cast(
+            User | None,
+            await self.session.scalar(select(User).where(User.email == email.strip().lower())),
+        )
+
+    async def by_id(self, user_id: str) -> User | None:
+        return cast(User | None, await self.session.get(User, user_id))
+
+
+=========================================
+=== File: ./src/temis_sso/security.py ===
+=========================================
+
+from argon2 import PasswordHasher
+from argon2.exceptions import VerificationError
+
+_hasher = PasswordHasher()
+
+
+def hash_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verify_password(password_hash: str, candidate: str) -> bool:
+    try:
+        return _hasher.verify(password_hash, candidate)
+    except VerificationError:
+        return False
+
+
+=========================================
+=== File: ./src/temis_sso/tokens.py ===
+=========================================
+
+import hashlib
+import secrets
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import cast
+
+import jwt
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from temis_sso.keyring import KeyRing
+from temis_sso.persistence import RefreshGrant, User
+
+ISSUER = "https://auth.lab.invalid"
+AUDIENCE = "temis-lab"
+ROLE_CLAIM = "https://temis.lab/roles"
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+class RingTokenCodec:
+    def __init__(self, ring: KeyRing) -> None:
+        self.ring = ring
+
+    @property
+    def kid(self) -> str:
+        return self.ring.active_kid()
+
+    def issue_access(
+        self,
+        user_id: str,
+        roles: list[str] | None = None,
+        audience: str = AUDIENCE,
+        *,
+        client_id: str = "temis-web",
+        scopes: list[str] | None = None,
+        authz_version: int = 1,
+    ) -> str:
+        now = datetime.now(UTC)
+        return self.ring.sign_claims(
+            {
+                "iss": ISSUER,
+                "aud": audience,
+                "sub": user_id,
+                "azp": client_id,
+                "scope": " ".join(scopes or ["profile:read"]),
+                ROLE_CLAIM: roles or [],
+                "authz_version": authz_version,
+                "auth_time": int(now.timestamp()),
+                "iat": now,
+                "exp": now + timedelta(minutes=10),
+            }
+        )
+
+    def verify_access(self, token: str, audience: str = AUDIENCE) -> dict[str, object]:
+        try:
+            header = jwt.get_unverified_header(token)
+            kid = header.get("kid")
+            if header.get("alg") != "RS256" or not isinstance(kid, str):
+                raise jwt.InvalidTokenError("RS256 kid required")
+            return cast(
+                dict[str, object],
+                jwt.decode(
+                    token,
+                    self.ring.verification_key(kid),
+                    algorithms=["RS256"],
+                    issuer=ISSUER,
+                    audience=audience,
+                    options={"require": ["iss", "aud", "sub", "exp"]},
+                ),
+            )
+        except ValueError as error:
+            raise jwt.InvalidTokenError("signing key is retired") from error
+
+    def jwk(self) -> dict[str, str]:
+        active = self.kid
+        return next(key for key in self.ring.jwks()["keys"] if key["kid"] == active)
+
+    def jwks(self) -> dict[str, list[dict[str, str]]]:
+        return self.ring.jwks()
+
+
+def _load_codec(root: Path = Path("var/keyring")) -> RingTokenCodec:
+    ring = KeyRing(root)
+    if not ring.jwks()["keys"]:
+        first = ring.publish()
+        ring.activate(first)
+    return RingTokenCodec(ring)
+
+
+codec = _load_codec()
+
+
+async def issue_refresh(session: AsyncSession, user_id: str, audience: str = AUDIENCE) -> str:
+    raw = secrets.token_urlsafe(48)
+    session.add(
+        RefreshGrant(
+            digest=token_digest(raw),
+            user_id=user_id,
+            audience=audience,
+            expires_at=datetime.now(UTC) + timedelta(days=14),
+        )
+    )
+    await session.flush()
+    return raw
+
+
+async def rotate_refresh(session: AsyncSession, raw: str) -> tuple[str, str, str] | None:
+    result = await session.execute(
+        update(RefreshGrant)
+        .where(
+            RefreshGrant.digest == token_digest(raw),
+            RefreshGrant.consumed_at.is_(None),
+            RefreshGrant.expires_at > datetime.now(UTC),
+            RefreshGrant.user_id.in_(select(User.id).where(User.status == "active")),
+        )
+        .values(consumed_at=datetime.now(UTC))
+        .returning(RefreshGrant.user_id, RefreshGrant.audience)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+    user_id, audience = row
+    return user_id, audience, await issue_refresh(session, user_id, audience)
+
+
+async def revoke_refresh(session: AsyncSession, raw: str) -> bool:
+    result = await session.execute(
+        update(RefreshGrant)
+        .where(RefreshGrant.digest == token_digest(raw), RefreshGrant.consumed_at.is_(None))
+        .values(consumed_at=datetime.now(UTC))
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+=========================================
+=== File: ./src/temis_sso/__init__.py ===
+=========================================
+
+"""Public learning implementation of a small FastAPI SSO service."""
+
+
+=========================================
+=== File: ./tests/conftest.py ===
+=========================================
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+def pytest_sessionstart() -> None:
+    subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from redis import Redis; Redis(host='127.0.0.1', port=56389).flushdb()",
+        ],
+        check=True,
+    )
+    private_key = Path("var/keys/access-private.pem")
+    public_key = Path("var/keys/access-public.pem")
+    if not private_key.exists() or not public_key.exists():
+        subprocess.run([sys.executable, "-m", "temis_sso.keygen"], check=True)
+
+
+=========================================
+=== File: ./tests/test_admin.py ===
+=========================================
+
+import asyncio
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from temis_sso.application.admin import approve_user, bootstrap_admin, redact
+from temis_sso.application.auth import mailbox
+from temis_sso.main import create_app
+from temis_sso.persistence import AuditLog, UserRepository, UserRole, session_scope
+
+client = TestClient(create_app())
+password = "correct horse battery"
+
+
+def register(active: bool = False) -> tuple[str, str]:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    response = client.post("/auth/register", json={"email": email, "password": password})
+    user_id = response.json()["user_id"]
+    if active:
+        client.post("/auth/verify", json={"token": mailbox[(email, "verify")]})
+    return user_id, email
+
+
+def login(email: str) -> dict[str, str]:
+    response = client.post("/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200
+    return response.json()
+
+
+def new_admin() -> tuple[str, dict[str, str], dict[str, str]]:
+    user_id, email = register()
+    asyncio.run(bootstrap_admin(user_id))
+    bundle = login(email)
+    return user_id, bundle, {"Authorization": f"Bearer {bundle['access_token']}"}
+
+
+def test_approval_role_and_audit_are_atomic() -> None:
+    _, _, headers = new_admin()
+    target_id, _ = register()
+    assert client.post(f"/admin/users/{target_id}/approve", headers=headers).status_code == 200
+
+    async def verify() -> None:
+        async with session_scope() as session:
+            assert (await UserRepository(session).by_id(target_id)).status == "active"
+            assert await session.get(UserRole, {"user_id": target_id, "role": "user"})
+            assert await session.scalar(
+                select(AuditLog).where(
+                    AuditLog.target_id == target_id, AuditLog.action == "user.approved"
+                )
+            )
+
+    asyncio.run(verify())
+
+
+def test_suspension_rejects_stale_access_and_refresh_sessions() -> None:
+    _, _, headers = new_admin()
+    target_id, email = register(active=True)
+    bundle = login(email)
+    response = client.post(
+        f"/admin/users/{target_id}/suspend", json={"reason": "access review"}, headers=headers
+    )
+    assert response.status_code == 200
+    assert (
+        client.get(
+            "/users/me", headers={"Authorization": f"Bearer {bundle['access_token']}"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post("/auth/refresh", json={"refresh_token": bundle["refresh_token"]}).status_code
+        == 401
+    )
+
+
+def test_self_actions_are_blocked() -> None:
+    admin_id, _, headers = new_admin()
+    assert (
+        client.post(
+            f"/admin/users/{admin_id}/suspend", json={"reason": "self test"}, headers=headers
+        ).status_code
+        == 409
+    )
+    assert client.delete(f"/admin/users/{admin_id}/roles/admin", headers=headers).status_code == 409
+    assert (
+        client.post(f"/admin/users/{admin_id}/revoke-sessions", headers=headers).status_code == 409
+    )
+
+
+def test_stale_admin_jwt_is_rejected_after_db_role_revocation() -> None:
+    first_id, _, first_headers = new_admin()
+    _, _, second_headers = new_admin()
+    assert (
+        client.delete(f"/admin/users/{first_id}/roles/admin", headers=second_headers).status_code
+        == 204
+    )
+    target_id, _ = register()
+    assert (
+        client.post(f"/admin/users/{target_id}/approve", headers=first_headers).status_code == 403
+    )
+
+
+@pytest.mark.asyncio
+async def test_transaction_rolls_back_on_failure() -> None:
+    actor_id, actor_email = register()
+    await bootstrap_admin(actor_id)
+    assert login(actor_email)["access_token"]
+    target_id, _ = register()
+    with pytest.raises(RuntimeError, match="simulated"):
+        await approve_user(actor_id, target_id, fail_for_test=True)
+    async with session_scope() as session:
+        assert (await UserRepository(session).by_id(target_id)).status == "pending"
+        assert (
+            await session.scalar(
+                select(AuditLog).where(
+                    AuditLog.target_id == target_id, AuditLog.action == "user.approved"
+                )
+            )
+            is None
+        )
+
+
+def test_audit_redaction_removes_secret_material() -> None:
+    assert redact(
+        {"access_token": "opaque", "reason": "Bearer sensitive-value", "safe": "role change"}
+    ) == {"access_token": "[REDACTED]", "reason": "[REDACTED]", "safe": "role change"}
+
+
+=========================================
+=== File: ./tests/test_authorization_mutation.py ===
+=========================================
+
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+from temis_sso.api.auth import issue_bundle
+from temis_sso.application.admin import bootstrap_admin, change_role, suspend_user
+from temis_sso.config import settings
+from temis_sso.main import create_app
+from temis_sso.persistence import UserRepository, UserRole, session_scope
+
+
+async def active_user(role: str = "user") -> str:
+    async with session_scope() as session:
+        user = await UserRepository(session).create(f"{uuid.uuid4().hex}@mail.test")
+        user.status = "active"
+        session.add(UserRole(user_id=user.id, role=role))
+        return user.id
+
+
+@pytest.mark.asyncio
+async def test_role_change_bumps_version_and_revokes_refresh() -> None:
+    actor = await active_user()
+    await bootstrap_admin(actor)
+    target = await active_user()
+    bundle = await issue_bundle(target)
+    async with session_scope() as session:
+        before = (await UserRepository(session).by_id(target)).authz_version
+    await change_role(actor, target, "reviewer", True)
+    async with session_scope() as session:
+        after = (await UserRepository(session).by_id(target)).authz_version
+    assert after == before + 1
+    response = TestClient(create_app()).post(
+        "/auth/refresh", json={"refresh_token": bundle.refresh_token}
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_rejects_stale_or_suspended_subject() -> None:
+    actor = await active_user()
+    await bootstrap_admin(actor)
+    target = await active_user()
+    bundle = await issue_bundle(target)
+    version = int(codec_claim(bundle.access_token, "authz_version"))
+    client = TestClient(create_app())
+    headers = {"X-Status-Key": settings.status_service_key}
+    assert (
+        client.post(
+            "/auth/status", json={"user_id": target, "authz_version": version}, headers=headers
+        ).json()["active"]
+        is True
+    )
+    await suspend_user(actor, target, "security review")
+    assert (
+        client.post(
+            "/auth/status", json={"user_id": target, "authz_version": version}, headers=headers
+        ).json()["active"]
+        is False
+    )
+    assert (
+        client.post("/auth/status", json={"user_id": target, "authz_version": version}).status_code
+        == 401
+    )
+
+
+def codec_claim(token: str, name: str) -> object:
+    from temis_sso.tokens import codec
+
+    return codec.verify_access(token)[name]
+
+
+=========================================
+=== File: ./tests/test_auth_data.py ===
+=========================================
+
+import uuid
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+
+from temis_sso.persistence import UserRepository, session_scope
+
+
+@pytest.mark.asyncio
+async def test_user_repository_normalizes_email() -> None:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    async with session_scope() as session:
+        user = await UserRepository(session).create(email.upper())
+        assert user.email == email
+        assert user.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_user_email_is_unique() -> None:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    async with session_scope() as session:
+        await UserRepository(session).create(email)
+    with pytest.raises(IntegrityError):
+        async with session_scope() as session:
+            await UserRepository(session).create(email)
+
+
+@pytest.mark.asyncio
+async def test_alembic_migration_is_applied() -> None:
+    async with session_scope() as session:
+        revision = await session.scalar(text("select version_num from alembic_version"))
+        assert revision == "0004_external_identity_links"
+
+
+=========================================
+=== File: ./tests/test_bff.py ===
+=========================================
+
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+from fastapi.testclient import TestClient
+
+from temis_bff.app import create_bff_app
+from temis_bff.oauth import BffOAuthFlow, OAuthFailed
+from temis_bff.security import (
+    RequestRejected,
+    require_csrf,
+    safe_return_path,
+    session_cookie,
+)
+from temis_bff.sessions import RedisSessionStore
+from temis_sso.config import settings
+from temis_sso.main import create_app as create_sso_app
+
+
+@pytest.mark.asyncio
+async def test_bff_state_is_one_time_and_tokens_stay_server_side() -> None:
+    flow = BffOAuthFlow(
+        settings.redis_url,
+        "https://auth.lab.invalid/oauth/authorize",
+        "temis-web",
+        "http://localhost:3000/auth/callback",
+    )
+    _, authorize_url = await flow.begin("/workspace")
+    state = authorize_url.split("state=", 1)[1]
+
+    async def exchange(code: str, verifier: str) -> dict[str, str]:
+        assert code == "one-time-code"
+        assert len(verifier) >= 43
+        return {
+            "user_id": "user-1",
+            "access_token": "access",
+            "refresh_token": "refresh",
+        }
+
+    tokens, target = await flow.complete(state, "one-time-code", exchange)
+    assert target == "/workspace"
+    assert "access" not in authorize_url and tokens["access_token"] == "access"
+    with pytest.raises(OAuthFailed):
+        await flow.complete(state, "one-time-code", exchange)
+
+
+@pytest.mark.asyncio
+async def test_opaque_session_keeps_tokens_in_redis() -> None:
+    store = RedisSessionStore(settings.redis_url)
+    opaque = await store.create("user-1", "access-secret", "refresh-secret")
+    assert "access-secret" not in opaque and "user-1" not in opaque
+    saved = await store.get(opaque)
+    assert saved is not None and saved.access_token == "access-secret"
+    await store.delete(opaque)
+    assert await store.get(opaque) is None
+
+
+def test_cookie_return_path_and_csrf_contract() -> None:
+    assert session_cookie(production=True) == {
+        "key": "__Host-temis_session",
+        "httponly": True,
+        "secure": True,
+        "samesite": "lax",
+        "path": "/",
+    }
+    assert safe_return_path("/workspace?tab=1") == "/workspace?tab=1"
+    for unsafe in ["https://evil.invalid", "//evil.invalid/path"]:
+        with pytest.raises(RequestRejected):
+            safe_return_path(unsafe)
+    require_csrf("https://app.lab.invalid", "https://app.lab.invalid", "csrf", "csrf")
+    with pytest.raises(RequestRejected):
+        require_csrf("https://evil.invalid", "https://app.lab.invalid", "csrf", "csrf")
+
+
+def test_fastapi_bff_login_session_and_logout_boundary() -> None:
+    flow = BffOAuthFlow(
+        settings.redis_url,
+        "https://auth.lab.invalid/oauth/authorize",
+        "temis-web",
+        "https://app.lab.invalid/auth/callback",
+    )
+    sessions = RedisSessionStore(settings.redis_url)
+    revoked: list[str] = []
+
+    async def exchange(code: str, verifier: str) -> dict[str, str]:
+        assert code == "authorization-code" and len(verifier) >= 43
+        return {
+            "user_id": "user-1",
+            "access_token": "server-access",
+            "refresh_token": "server-refresh",
+        }
+
+    async def revoke(refresh_token: str) -> None:
+        revoked.append(refresh_token)
+
+    client = TestClient(
+        create_bff_app(
+            flow,
+            sessions,
+            exchange,
+            revoke,
+            public_origin="https://app.lab.invalid",
+            production=True,
+        ),
+        base_url="https://app.lab.invalid",
+    )
+    login = client.get("/login?return_to=/workspace", follow_redirects=False)
+    assert login.status_code == 303
+    state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+    assert client.get("/auth/callback?code=bad&state=missing").status_code == 401
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "authorization-code", "state": state},
+        follow_redirects=False,
+    )
+    cookie = callback.headers["set-cookie"]
+    assert callback.status_code == 303 and "__Host-temis_session=" in cookie
+    assert "HttpOnly" in cookie and "Secure" in cookie and "SameSite=lax" in cookie
+    session_response = client.get("/bff/session")
+    assert session_response.headers["cache-control"] == "no-store, private"
+    session = session_response.json()
+    assert set(session) == {"user_id", "csrf_token"}
+    assert client.post("/logout").status_code == 403
+    assert (
+        client.post(
+            "/logout",
+            headers={"Origin": "https://evil.invalid", "X-CSRF-Token": session["csrf_token"]},
+        ).status_code
+        == 403
+    )
+    logout = client.post(
+        "/logout",
+        headers={"Origin": "https://app.lab.invalid", "X-CSRF-Token": session["csrf_token"]},
+    )
+    assert logout.status_code == 204 and "Max-Age=0" in logout.headers["set-cookie"]
+    missing = client.get("/bff/session")
+    assert missing.status_code == 401 and missing.headers["cache-control"] == "no-store, private"
+    assert revoked == ["server-refresh"]
+    token_error = TestClient(create_sso_app()).post(
+        "/oauth/token",
+        data={"grant_type": "authorization_code"},
+    )
+    assert token_error.status_code == 400
+    assert token_error.headers["cache-control"] == "no-store"
+
+
+=========================================
+=== File: ./tests/test_client_policy.py ===
+=========================================
+
+from fastapi.testclient import TestClient
+
+from temis_sso.main import create_app
+
+client = TestClient(create_app())
+
+
+def test_cors_is_exact_origin_allowlist() -> None:
+    allowed = client.options(
+        "/oauth/token",
+        headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST"},
+    )
+    denied = client.options(
+        "/oauth/token",
+        headers={"Origin": "http://evil.local", "Access-Control-Request-Method": "POST"},
+    )
+    assert allowed.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert "access-control-allow-origin" not in denied.headers
+
+
+=========================================
+=== File: ./tests/test_e2e_failures.py ===
+=========================================
+
+import asyncio
+import uuid
+from urllib.parse import urlsplit
+
+import pytest
+from fastapi.testclient import TestClient
+
+from resource_api.app import create_resource_app
+from resource_api.auth import DependencyUnavailable, JwksVerifier
+from temis_bff.app import create_bff_app
+from temis_bff.oauth import BffOAuthFlow, OAuthFailed
+from temis_bff.sessions import RedisSessionStore
+from temis_sso.config import settings
+from temis_sso.fake_provider import FakeOAuthProvider, ProviderIdentity
+from temis_sso.main import create_app
+from temis_sso.observability import current_request_id
+from temis_sso.tokens import codec
+
+
+@pytest.mark.asyncio
+async def test_bff_replay_and_incomplete_exchange_fail_closed() -> None:
+    flow = BffOAuthFlow(
+        settings.redis_url,
+        "https://auth.lab.invalid/oauth/authorize",
+        "temis-web",
+        "http://localhost:3000/auth/callback",
+    )
+    _, url = await flow.begin("/")
+    state = url.split("state=", 1)[1]
+
+    async def incomplete(code: str, verifier: str) -> dict[str, str]:
+        return {"user_id": "user-1"}
+
+    with pytest.raises(OAuthFailed):
+        await flow.complete(state, "code", incomplete)
+    with pytest.raises(OAuthFailed):
+        await flow.complete(state, "code", incomplete)
+
+
+@pytest.mark.asyncio
+async def test_jwks_outage_without_cache_fails_closed() -> None:
+    async def unavailable() -> dict[str, object]:
+        raise ConnectionError("JWKS unavailable")
+
+    async def status(subject: str, version: int) -> bool:
+        return True
+
+    verifier = JwksVerifier(
+        unavailable,
+        status,
+        issuer="https://auth.lab.invalid",
+        audience="temis-lab",
+        authorized_party="temis-web",
+    )
+    with pytest.raises(DependencyUnavailable):
+        await verifier.authenticate(codec.issue_access("user-1"))
+
+
+@pytest.mark.asyncio
+async def test_redis_session_loss_requires_a_new_server_session() -> None:
+    sessions = RedisSessionStore(settings.redis_url)
+    flow = BffOAuthFlow(
+        settings.redis_url,
+        "http://auth.lab.invalid/oauth/authorize",
+        "temis-web",
+        "http://localhost:3000/auth/callback",
+    )
+
+    async def exchange(code: str, verifier: str) -> dict[str, str]:
+        raise AssertionError("session endpoint must not exchange tokens")
+
+    async def revoke(refresh_token: str) -> None:
+        return None
+
+    client = TestClient(create_bff_app(flow, sessions, exchange, revoke))
+    first = await sessions.create("user-1", "access-1", "refresh-1")
+    client.cookies.set("temis_session", first)
+    assert client.get("/bff/session").status_code == 200
+    await sessions.delete(first)
+    assert client.get("/bff/session").status_code == 401
+    replacement = await sessions.create("user-1", "access-2", "refresh-2")
+    client.cookies.set("temis_session", replacement)
+    assert client.get("/bff/session").status_code == 200
+    await sessions.delete(replacement)
+
+
+def test_http_login_bff_resource_and_logout_end_to_end() -> None:
+    request_id = "req-e2e-flow"
+    sso_logs: list[str] = []
+    sso = TestClient(create_app(log_sink=sso_logs))
+    sessions = RedisSessionStore(settings.redis_url)
+    flow = BffOAuthFlow(
+        settings.redis_url,
+        "http://auth.lab.invalid/oauth/authorize",
+        "temis-web",
+        "http://localhost:3000/auth/callback",
+    )
+
+    async def exchange(code: str, verifier: str) -> dict[str, str]:
+        assert current_request_id() == request_id
+        response = sso.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": "temis-web",
+                "redirect_uri": "http://localhost:3000/auth/callback",
+                "code": code,
+                "code_verifier": verifier,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    async def revoke(refresh_token: str) -> None:
+        assert current_request_id() == request_id
+        assert (
+            sso.post(
+                "/auth/logout",
+                json={"refresh_token": refresh_token},
+                headers={"X-Request-ID": request_id},
+            ).status_code
+            == 204
+        )
+
+    bff_logs: list[str] = []
+    bff = TestClient(create_bff_app(flow, sessions, exchange, revoke, log_sink=bff_logs))
+    authorize_url = bff.get(
+        "/login", headers={"X-Request-ID": request_id}, follow_redirects=False
+    ).headers["location"]
+    parsed = urlsplit(authorize_url)
+    provider = sso.get(
+        f"{parsed.path}?{parsed.query}",
+        headers={"X-Request-ID": request_id},
+        follow_redirects=False,
+    )
+    account = f"e2e-{uuid.uuid4().hex}"
+    FakeOAuthProvider.accounts[account] = ProviderIdentity("lab-provider", account)
+    provider_callback = sso.get(
+        f"{provider.headers['location']}&account={account}",
+        headers={"X-Request-ID": request_id},
+        follow_redirects=False,
+    )
+    bff_callback = sso.get(
+        provider_callback.headers["location"],
+        headers={"X-Request-ID": request_id},
+        follow_redirects=False,
+    )
+    parsed_callback = urlsplit(bff_callback.headers["location"])
+    assert (
+        bff.get(
+            f"{parsed_callback.path}?{parsed_callback.query}",
+            headers={"X-Request-ID": request_id},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
+    session_id = bff.cookies.get("temis_session")
+    assert session_id is not None
+    server_session = asyncio.run(sessions.get(session_id))
+    assert server_session is not None
+
+    async def fetch_jwks() -> dict[str, object]:
+        assert current_request_id() == request_id
+        return sso.get("/.well-known/jwks.json", headers={"X-Request-ID": request_id}).json()
+
+    async def check_status(subject: str, version: int) -> bool:
+        assert current_request_id() == request_id
+        response = sso.post(
+            "/auth/status",
+            json={"user_id": subject, "authz_version": version},
+            headers={"X-Status-Key": settings.status_service_key, "X-Request-ID": request_id},
+        )
+        return bool(response.json()["active"])
+
+    verifier = JwksVerifier(
+        fetch_jwks,
+        check_status,
+        issuer="https://auth.lab.invalid",
+        audience="temis-lab",
+        authorized_party="temis-web",
+    )
+    resource_logs: list[str] = []
+    resource = TestClient(create_resource_app(verifier, log_sink=resource_logs))
+    report = resource.get(
+        "/api/reports",
+        headers={
+            "Authorization": f"Bearer {server_session.access_token}",
+            "X-Request-ID": request_id,
+        },
+    )
+    assert report.status_code == 200
+    exposed = bff.get("/bff/session", headers={"X-Request-ID": request_id}).json()
+    logout = bff.post(
+        "/logout",
+        headers={
+            "Origin": "http://localhost:3000",
+            "X-CSRF-Token": exposed["csrf_token"],
+            "X-Request-ID": request_id,
+        },
+    )
+    assert logout.status_code == 204 and asyncio.run(sessions.get(session_id)) is None
+    assert sso_logs and bff_logs and resource_logs
+    assert all(request_id in log for log in [*sso_logs, *bff_logs, *resource_logs])
+
+
+=========================================
+=== File: ./tests/test_external_idp_contract.py ===
+=========================================
+
+import asyncio
+import hashlib
+from base64 import urlsafe_b64encode
+from typing import Any, cast
+
+import httpx
+import pytest
+
+from temis_sso.external_idp.google import GoogleOidcAdapter
+from temis_sso.external_idp.models import AuthorizationRequest, ProviderMetadata
+from temis_sso.external_idp.security import FlowStore
+
+
+def test_provider_metadata_rejects_non_https_endpoints() -> None:
+    with pytest.raises(ValueError, match="HTTPS"):
+        ProviderMetadata(
+            issuer="https://accounts.google.test",
+            authorization_endpoint="http://accounts.google.test/auth",
+            token_endpoint="https://accounts.google.test/token",
+            userinfo_endpoint="https://accounts.google.test/userinfo",
+            revocation_endpoint="https://accounts.google.test/revoke",
+            jwks_uri="https://accounts.google.test/jwks",
+        )
+
+
+def test_flow_store_consumes_state_once_and_checks_ttl() -> None:
+    store = FlowStore(ttl_seconds=60)
+    flow = store.issue(
+        "https://client.lab.invalid/callback", now=100, browser_binding="browser-binding-123"
+    )
+    assert store.consume(flow.state, now=159, browser_binding="browser-binding-123") == flow
+    with pytest.raises(ValueError, match="unknown or already used"):
+        store.consume(flow.state, now=159, browser_binding="browser-binding-123")
+    expired = store.issue(
+        "https://client.lab.invalid/callback", now=200, browser_binding="browser-binding-123"
+    )
+    with pytest.raises(ValueError, match="expired"):
+        store.consume(expired.state, now=261, browser_binding="browser-binding-123")
+    bound = store.issue(
+        "https://client.lab.invalid/callback", now=300, browser_binding="browser-binding-123"
+    )
+    with pytest.raises(ValueError, match="browser binding"):
+        store.consume(bound.state, now=301, browser_binding="other-browser-456")
+    assert store.consume(bound.state, now=301, browser_binding="browser-binding-123") == bound
+
+
+def test_flow_store_requires_non_empty_browser_binding() -> None:
+    store = FlowStore()
+    issue = cast(Any, store.issue)
+    with pytest.raises(TypeError):
+        issue("https://client.lab.invalid/callback", now=100)
+    with pytest.raises(ValueError, match="browser binding"):
+        store.issue("https://client.lab.invalid/callback", now=100, browser_binding="")
+
+
+def test_pkce_challenge_is_s256() -> None:
+    store = FlowStore()
+    flow = store.issue(
+        "https://client.lab.invalid/callback", now=100, browser_binding="browser-binding-123"
+    )
+    expected = urlsafe_b64encode(hashlib.sha256(flow.code_verifier.encode()).digest()).rstrip(b"=")
+    assert flow.code_challenge == expected.decode()
+
+
+def test_google_discovery_and_authorization_request_use_security_parameters() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/.well-known/openid-configuration"
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://accounts.google.com",
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+                "token_endpoint": "https://oauth2.googleapis.com/token",
+                "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+                "revocation_endpoint": "https://oauth2.googleapis.com/revoke",
+                "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+            },
+        )
+
+    async def scenario() -> AuthorizationRequest:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = GoogleOidcAdapter(
+                client_id="local-google-client",
+                client_secret="local-google-fixture-secret",
+                http=client,
+            )
+            metadata = await adapter.discover()
+            flow = FlowStore().issue(
+                "https://client.lab.invalid/callback",
+                now=100,
+                browser_binding="browser-binding-123",
+            )
+            return adapter.authorization_request(metadata, flow)
+
+    request = asyncio.run(scenario())
+    assert request.parameters["state"]
+    assert request.parameters["nonce"]
+    assert request.parameters["code_challenge_method"] == "S256"
+    assert request.parameters["scope"] == "openid email profile"
+    assert "client_secret" not in request.parameters
+
+
+def test_discovery_rejects_issuer_mismatch() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://attacker.lab.invalid",
+                "authorization_endpoint": "https://accounts.google.com/auth",
+                "token_endpoint": "https://accounts.google.com/token",
+                "userinfo_endpoint": "https://accounts.google.com/userinfo",
+                "revocation_endpoint": "https://accounts.google.com/revoke",
+                "jwks_uri": "https://accounts.google.com/jwks",
+            },
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = GoogleOidcAdapter(
+                "local-google-client",
+                "local-google-fixture-secret",
+                client,
+            )
+            await adapter.discover()
+
+    with pytest.raises(ValueError, match="issuer mismatch"):
+        asyncio.run(scenario())
+
+
+def test_google_code_exchange_binds_redirect_and_pkce_and_requires_no_store() -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "no-store"},
+            json={"id_token": "signed-id-token"},
+        )
+
+    async def scenario() -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = GoogleOidcAdapter(
+                "local-google-client",
+                "local-google-fixture-secret",
+                client,
+            )
+            flow = FlowStore().issue(
+                "https://client.lab.invalid/callback",
+                now=100,
+                browser_binding="browser-binding-123",
+            )
+            metadata = ProviderMetadata(
+                issuer="https://accounts.google.test",
+                authorization_endpoint="https://accounts.google.test/auth",
+                token_endpoint="https://accounts.google.test/token",
+                userinfo_endpoint="https://accounts.google.test/userinfo",
+                revocation_endpoint="https://accounts.google.test/revoke",
+                jwks_uri="https://accounts.google.test/jwks",
+            )
+            result = await adapter.exchange_code(metadata, "authorization-code", flow)
+            assert captured["redirect_uri"] == flow.redirect_uri
+            assert captured["code_verifier"] == flow.code_verifier
+            assert captured["client_secret"] == "local-google-fixture-secret"
+            return result
+
+    assert asyncio.run(scenario()) == "signed-id-token"
+
+
+=========================================
+=== File: ./tests/test_google_account_link.py ===
+=========================================
+
+import asyncio
+import json
+from uuid import uuid4
+
+import httpx
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
+from sqlalchemy.exc import IntegrityError
+
+from temis_sso.external_idp.callback import GoogleCallbackService, JwksCache, verify_google_id_token
+from temis_sso.external_idp.external_accounts import (
+    ConfirmedAccountLinkService,
+    ExternalIdentityLinkRepository,
+)
+from temis_sso.external_idp.google import GoogleOidcAdapter
+from temis_sso.external_idp.models import ExternalIdentity, ProviderMetadata
+from temis_sso.external_idp.security import FlowStore
+from temis_sso.external_idp.sessions import SessionStore
+from temis_sso.persistence import UserRepository, session_scope
+
+PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+PUBLIC_JWK = json.loads(RSAAlgorithm.to_jwk(PRIVATE_KEY.public_key()))
+PUBLIC_JWK["kid"] = "google-key-1"
+
+
+def metadata() -> ProviderMetadata:
+    return ProviderMetadata(
+        issuer="https://accounts.google.com",
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        userinfo_endpoint="https://openidconnect.googleapis.com/v1/userinfo",
+        revocation_endpoint="https://oauth2.googleapis.com/revoke",
+        jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+    )
+
+
+def token(*, omit: str | None = None, **overrides: object) -> str:
+    claims: dict[str, object] = {
+        "iss": "https://accounts.google.com",
+        "aud": "local-google-client",
+        "sub": "google-123",
+        "nonce": "nonce-123",
+        "iat": 1_700_000_000,
+        "exp": 2_000_000_000,
+        "email": "learner@lab.invalid",
+        "email_verified": True,
+    }
+    claims.update(overrides)
+    if omit is not None:
+        claims.pop(omit)
+    return jwt.encode(claims, PRIVATE_KEY, algorithm="RS256", headers={"kid": "google-key-1"})
+
+
+async def verify(encoded: str, keys: list[dict[str, object]] | None = None) -> ExternalIdentity:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "public, max-age=300"},
+            json={"keys": keys if keys is not None else [PUBLIC_JWK]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await verify_google_id_token(
+            encoded, metadata(), client, "local-google-client", "nonce-123", JwksCache(), 100
+        )
+
+
+def test_google_id_token_validates_rs256_jwks_and_all_boundary_claims() -> None:
+    assert asyncio.run(verify(token())) == ExternalIdentity(
+        "google", "google-123", "learner@lab.invalid", True
+    )
+
+
+@pytest.mark.parametrize(
+    ("claim", "value", "message"),
+    [
+        ("iss", "https://attacker.lab.invalid", "issuer"),
+        ("aud", "other-client", "audience"),
+        ("nonce", "wrong", "nonce"),
+    ],
+)
+def test_google_id_token_rejects_boundary_mismatch(claim: str, value: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(verify(token(**{claim: value})))
+
+
+def test_google_id_token_rejects_unknown_kid_and_algorithm_confusion() -> None:
+    with pytest.raises(ValueError, match="signing key is unknown"):
+        asyncio.run(verify(token(), keys=[]))
+    hs_token = jwt.encode(
+        {"sub": "google-123", "exp": 2_000_000_000},
+        "local-fixture-signing-material-long-enough",
+        algorithm="HS256",
+        headers={"kid": "google-key-1"},
+    )
+    with pytest.raises(ValueError, match="algorithm"):
+        asyncio.run(verify(hs_token))
+
+
+def test_jwks_cache_honors_max_age_and_refreshes_unknown_kid_once() -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200, headers={"Cache-Control": "public, max-age=300"}, json={"keys": [PUBLIC_JWK]}
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cache = JwksCache()
+            assert (await cache.key(metadata(), client, "google-key-1", 100))["kid"]
+            assert (await cache.key(metadata(), client, "google-key-1", 200))["kid"]
+            with pytest.raises(ValueError, match="unknown"):
+                await cache.key(metadata(), client, "rotated-key", 200)
+
+    asyncio.run(scenario())
+    assert calls == 2
+
+
+@pytest.mark.parametrize("missing", ["exp", "sub", "nonce"])
+def test_google_id_token_requires_security_claims(missing: str) -> None:
+    with pytest.raises(ValueError, match="invalid ID token"):
+        asyncio.run(verify(token(omit=missing)))
+
+
+def test_google_id_token_rejects_expired_and_checks_azp_for_multiple_audiences() -> None:
+    with pytest.raises(ValueError, match="invalid ID token"):
+        asyncio.run(verify(token(exp=1)))
+    with pytest.raises(ValueError, match="authorized party"):
+        asyncio.run(verify(token(aud=["local-google-client", "other"], azp="other")))
+    assert (
+        asyncio.run(
+            verify(token(aud=["local-google-client", "other"], azp="local-google-client"))
+        ).subject
+        == "google-123"
+    )
+
+
+@pytest.mark.asyncio
+async def test_account_link_requires_confirmation_and_rolls_back_subject_collision() -> None:
+    subject = f"subject-{uuid4()}"
+    identity = ExternalIdentity("google", subject, "learner@lab.invalid", True)
+    async with session_scope() as database:
+        first = await UserRepository(database).create(f"first-{uuid4()}@lab.invalid")
+        second = await UserRepository(database).create(f"second-{uuid4()}@lab.invalid")
+        service = ConfirmedAccountLinkService(ExternalIdentityLinkRepository(database))
+        with pytest.raises(ValueError, match="authenticated"):
+            await service.link("", identity, confirmed=True)
+        with pytest.raises(ValueError, match="confirmation"):
+            await service.link(first.id, identity, confirmed=False)
+        await service.link(first.id, identity, confirmed=True)
+        first_id, second_id = first.id, second.id
+    async with session_scope() as database:
+        repository = ExternalIdentityLinkRepository(database)
+        service = ConfirmedAccountLinkService(repository)
+        with pytest.raises(IntegrityError):
+            await service.link(second_id, identity, confirmed=True)
+        await database.rollback()
+        assert await repository.resolve("google", subject) == first_id
+
+
+@pytest.mark.asyncio
+async def test_callback_orchestrates_security_and_persistent_link_before_session() -> None:
+    flows = FlowStore()
+    flow = flows.issue(
+        "https://client.lab.invalid/callback",
+        now=100,
+        browser_binding="browser-binding-123",
+    )
+    subject = f"callback-subject-{uuid4()}"
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/.well-known/openid-configuration":
+            return httpx.Response(200, json=metadata().__dict__)
+        if request.url.path == "/token":
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "no-store"},
+                json={"id_token": token(nonce=flow.nonce, sub=subject)},
+            )
+        if request.url.path == "/oauth2/v3/certs":
+            return httpx.Response(
+                200,
+                headers={"Cache-Control": "public, max-age=300"},
+                json={"keys": [PUBLIC_JWK]},
+            )
+        return httpx.Response(200)
+
+    async with session_scope() as database:
+        user = await UserRepository(database).create(f"callback-{uuid4()}@lab.invalid")
+        links = ExternalIdentityLinkRepository(database)
+        await ConfirmedAccountLinkService(links).link(
+            user.id,
+            ExternalIdentity("google", subject, "learner@lab.invalid", True),
+            confirmed=True,
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            sessions = SessionStore()
+            service = GoogleCallbackService(
+                GoogleOidcAdapter("local-google-client", "local-google-fixture-secret", client),
+                flows,
+                links,
+                sessions,
+                client,
+                JwksCache(),
+            )
+            session = await service.finish_callback(
+                flow.state,
+                "authorization-code",
+                101,
+                "browser-binding-123",
+            )
+            assert sessions.resolve(session) == user.id
+            assert await service.revoke(metadata(), "provider-access-token")
+    assert calls == [
+        "/.well-known/openid-configuration",
+        "/token",
+        "/oauth2/v3/certs",
+        "/revoke",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_external_identity_link_is_persisted_in_auth_database() -> None:
+    async with session_scope() as session:
+        user = await UserRepository(session).create(f"external-{uuid4()}@lab.invalid")
+        links = ExternalIdentityLinkRepository(session)
+        subject = f"subject-{uuid4()}"
+        await ConfirmedAccountLinkService(links).link(
+            user.id,
+            ExternalIdentity("google", subject, None, False),
+            confirmed=True,
+        )
+        assert await links.resolve("google", subject) == user.id
+
+
+=========================================
+=== File: ./tests/test_oauth.py ===
+=========================================
+
+import base64
+import hashlib
+from urllib.parse import parse_qs, urlsplit
+
+from fastapi.testclient import TestClient
+
+from temis_sso.main import create_app
+
+client = TestClient(create_app())
+verifier = "v" * 43
+challenge = (
+    base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+)
+
+
+def authorization() -> tuple[str, str]:
+    response = client.get(
+        "/oauth/authorize",
+        params={
+            "client_id": "temis-web",
+            "redirect_uri": "http://localhost:3000/auth/callback",
+            "response_type": "code",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "client-state-value",
+        },
+        follow_redirects=False,
+    )
+    provider = client.get(response.headers["location"], follow_redirects=False)
+    callback = client.get(provider.headers["location"], follow_redirects=False)
+    query = parse_qs(urlsplit(callback.headers["location"]).query)
+    return query["code"][0], query["state"][0]
+
+
+def test_authorization_code_pkce_and_state_round_trip() -> None:
+    code, state = authorization()
+    assert state == "client-state-value"
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": "temis-web",
+        "redirect_uri": "http://localhost:3000/auth/callback",
+        "code": code,
+        "code_verifier": verifier,
+    }
+    tokens = client.post("/oauth/token", data=payload)
+    assert tokens.status_code == 200 and "access_token" in tokens.json()
+    assert tokens.headers["cache-control"] == "no-store"
+    assert tokens.headers["pragma"] == "no-cache"
+    assert client.post("/oauth/token", data=payload).status_code == 401
+
+
+def test_unknown_client_never_redirects() -> None:
+    response = client.get(
+        "/oauth/authorize",
+        params={
+            "client_id": "unknown",
+            "redirect_uri": "https://evil.invalid/callback",
+            "code_challenge": challenge,
+            "state": "client-state-value",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400 and "location" not in response.headers
+
+
+def test_wrong_verifier_consumes_code_and_fails_closed() -> None:
+    code, _ = authorization()
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": "temis-web",
+        "redirect_uri": "http://localhost:3000/auth/callback",
+        "code": code,
+        "code_verifier": "x" * 43,
+    }
+    assert client.post("/oauth/token", data=payload).status_code == 401
+    payload["code_verifier"] = verifier
+    assert client.post("/oauth/token", data=payload).status_code == 401
+
+
+=========================================
+=== File: ./tests/test_observability.py ===
+=========================================
+
+import json
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from temis_sso.observability import Metrics, StructuredLogger, install_observability, redact
+
+
+def test_structured_logs_redact_nested_credentials() -> None:
+    output: list[str] = []
+    logger = StructuredLogger("sso", output.append)
+    logger.event(
+        "token.exchange",
+        "rejected",
+        "req-123",
+        authorization="Bearer raw",
+        payload={"code": "raw-code", "profile": {"email": "learner@lab.invalid"}},
+        reason="pkce_mismatch",
+        errors=["safe", "Bearer nested-secret"],
+    )
+    record = json.loads(output[0])
+    assert record["authorization"] == "[REDACTED]"
+    assert record["payload"]["code"] == "[REDACTED]"
+    assert record["payload"]["profile"]["email"] == "[REDACTED]"
+    assert "raw-code" not in output[0] and record["reason"] == "pkce_mismatch"
+    assert record["errors"][1] == "[REDACTED]"
+    for secret in [
+        "Cookie: __Host-temis_session=opaque",
+        "redirect state=oauth-state",
+        "code_verifier=pkce-secret",
+        "csrf=csrf-secret",
+    ]:
+        assert redact(f"failure: {secret}") == "[REDACTED]"
+
+
+def test_metrics_allow_only_bounded_labels() -> None:
+    metrics = Metrics()
+    metrics.increment("temis_auth_requests_total", {"route": "token", "outcome": "success"})
+    assert 'route="token"' in metrics.render()
+    with pytest.raises(ValueError):
+        metrics.increment(
+            "temis_auth_requests_total",
+            {"route": "/users/unique-id", "outcome": "success"},
+        )
+    with pytest.raises(ValueError):
+        metrics.increment("temis_auth_requests_total", {"route": "token", "user_id": "user-1"})
+
+
+def test_operational_runbooks_cover_rollback_and_evidence() -> None:
+    from pathlib import Path
+
+    matrix = Path("ops/E2E-FAILURE-MATRIX.md").read_text()
+    rollback = Path("ops/ROLLBACK-RUNBOOK.md").read_text()
+    incident = Path("ops/INCIDENT-RUNBOOK.md").read_text()
+    assert "authorization code replay" in matrix and "checksum mismatch" in matrix
+    assert "roll back the application before the schema" in rollback
+    assert "unknown keys fail closed" in incident and "isolated database restore" in incident
+
+
+def test_observability_middleware_propagates_request_id() -> None:
+    app = FastAPI()
+    logs: list[str] = []
+    metrics = Metrics()
+
+    @app.get("/oauth/token")
+    async def endpoint() -> dict[str, str]:
+        return {"status": "ok"}
+
+    install_observability(app, "test", metrics, logs.append)
+    response = TestClient(app).get("/oauth/token", headers={"X-Request-ID": "req-fixed"})
+    assert response.headers["x-request-id"] == "req-fixed"
+    assert "req-fixed" in logs[0] and 'route="token"' in metrics.render()
+
+
+def test_default_structured_sink_does_not_retain_one_log_per_request() -> None:
+    app = FastAPI()
+    metrics = Metrics()
+
+    @app.get("/health")
+    async def endpoint() -> dict[str, str]:
+        return {"status": "ok"}
+
+    install_observability(app, "bounded", metrics)
+    client = TestClient(app)
+    for _ in range(100):
+        assert client.get("/health").status_code == 200
+    assert len(metrics._values) == 1
+
+
+=========================================
+=== File: ./tests/test_operations.py ===
+=========================================
+
+import asyncio
+import concurrent.futures
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import jwt
+import pytest
+from sqlalchemy import text
+
+from resource_api.auth import JwksVerifier, TokenRejected
+from temis_sso.config import settings
+from temis_sso.keyring import KeyRing
+from temis_sso.persistence import session_scope
+from temis_sso.tokens import RingTokenCodec
+
+
+def test_key_rotation_publish_activate_retire(tmp_path: Path) -> None:
+    now = [0.0]
+    ring = KeyRing(tmp_path, clock=lambda: now[0], overlap_seconds=960)
+    old = ring.publish()
+    assert (tmp_path / f"{old}.private.pem").stat().st_mode & 0o777 == 0o600
+    ring.activate(old)
+    token = ring.sign("user-1", "https://auth.lab.invalid", "temis-lab")
+    new = ring.publish()
+    assert {key["kid"] for key in ring.jwks()["keys"]} == {old, new}
+    now[0] = 10
+    ring.activate(new)
+    assert (
+        jwt.get_unverified_header(ring.sign("user-1", "https://auth.lab.invalid", "temis-lab"))[
+            "kid"
+        ]
+        == new
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        ring.retire(old)
+    now[0] = 969
+    with pytest.raises(ValueError, match="overlap"):
+        ring.retire(old)
+    now[0] = 970
+    ring.retire(old)
+    assert {key["kid"] for key in ring.jwks()["keys"]} == {new}
+    with pytest.raises(ValueError):
+        ring.retire(new)
+    assert jwt.get_unverified_header(token)["kid"] == old
+
+
+def test_expand_contract_and_restore_runbook_are_safe() -> None:
+    expand = Path("migrations/versions/0002_expand_authz_version.py").read_text()
+    contract = Path("migrations/versions/0003_contract_authz_version.py").read_text()
+    restore = Path("scripts/restore-isolated.sh").read_text()
+    assert "nullable=True" in expand and "nullable=False" in contract
+    assert "sha256sum --check" in restore and "refusing to restore" in restore
+    assert "RESTORE_LIBPQ_URL" in restore and "RESTORE_ASYNC_DATABASE_URL" in restore
+    assert "EXPECTED_RESTORE_DATABASE|t" in restore
+
+
+def test_secret_boundary_assigns_private_keys_only_to_signer() -> None:
+    boundary = Path("ops/SECRET-BOUNDARY.md").read_text()
+    assert "SSO signer alone reads private signing keys" in boundary
+    assert "Resource API receives only public JWKS" in boundary
+
+
+def test_restore_script_executes_only_against_propagated_isolated_url(tmp_path: Path) -> None:
+    archive = tmp_path / "backup.dump"
+    archive.write_text("validated backup")
+    checksum = subprocess.run(
+        ["sha256sum", str(archive)], capture_output=True, text=True, check=True
+    ).stdout
+    Path(f"{archive}.sha256").write_text(checksum)
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    marker = tmp_path / "calls"
+    for name in ["alembic", "pytest"]:
+        executable = tools / name
+        executable.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"echo {name}:$TEMIS_LAB_DATABASE_URL >> {marker}\n"
+        )
+        executable.chmod(0o755)
+    psql = tools / "psql"
+    psql.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"${PSQL_IDENTITY:-isolated_restore|t}\"\n"
+    )
+    psql.chmod(0o755)
+    pg_restore = tools / "pg_restore"
+    pg_restore.write_text(
+        f"#!/usr/bin/env bash\nset -euo pipefail\necho pg_restore:$* >> {marker}\n"
+    )
+    pg_restore.chmod(0o755)
+    verifier = tools / "verify-python"
+    verifier.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"echo verifier:$RESTORE_ASYNC_DATABASE_URL >> {marker}\n"
+    )
+    verifier.chmod(0o755)
+    libpq = "postgresql://lab@127.0.0.1:55439/isolated_restore"
+    async_url = "postgresql+asyncpg://lab@127.0.0.1:55439/isolated_restore"
+    environment = {
+        **os.environ,
+        "PATH": f"{tools}:{os.environ['PATH']}",
+        "ARCHIVE": str(archive),
+        "RESTORE_LIBPQ_URL": libpq,
+        "RESTORE_ASYNC_DATABASE_URL": async_url,
+        "EXPECTED_RESTORE_DATABASE": "isolated_restore",
+        "PYTHON_BIN": str(verifier),
+    }
+    subprocess.run(["bash", "scripts/restore-isolated.sh"], env=environment, check=True)
+    calls = marker.read_text()
+    assert f"pg_restore:--exit-on-error --clean --if-exists --dbname {libpq}" in calls
+    assert calls.count(async_url) == 3
+    for production in [
+        {"PRODUCTION_LIBPQ_URL": libpq},
+        {"PRODUCTION_ASYNC_DATABASE_URL": async_url},
+    ]:
+        refused = subprocess.run(
+            ["bash", "scripts/restore-isolated.sh"],
+            env={**environment, **production},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert refused.returncode == 2 and "refusing" in refused.stderr
+
+    before = marker.read_text()
+    wrong_target = subprocess.run(
+        ["bash", "scripts/restore-isolated.sh"],
+        env={**environment, "PSQL_IDENTITY": "production|f"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert wrong_target.returncode == 3 and marker.read_text() == before
+
+    archive.write_text("tampered")
+    bad_checksum = subprocess.run(
+        ["bash", "scripts/restore-isolated.sh"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad_checksum.returncode != 0 and marker.read_text() == before
+
+
+def test_packaged_compose_has_persistence_and_health_contract() -> None:
+    result = subprocess.run(
+        ["docker", "compose", "-f", "compose.yaml", "config"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "postgres-data" in result.stdout and "redis-data" in result.stdout
+    assert result.stdout.count("healthcheck:") == 2
+
+
+@pytest.mark.asyncio
+async def test_async_restore_verifier_queries_live_identity_and_marker() -> None:
+    async with session_scope() as session:
+        await session.execute(text("create table if not exists temis_restore_target(id integer)"))
+    expected = settings.database_url.rsplit("/", 1)[-1]
+    verified = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "scripts/verify-restore-target.py",
+        env={
+            **os.environ,
+            "RESTORE_ASYNC_DATABASE_URL": settings.database_url,
+            "EXPECTED_RESTORE_DATABASE": expected,
+        },
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, verified_stderr = await verified.communicate()
+    assert verified.returncode == 0, verified_stderr.decode()
+    rejected = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "scripts/verify-restore-target.py",
+        env={
+            **os.environ,
+            "RESTORE_ASYNC_DATABASE_URL": settings.database_url,
+            "EXPECTED_RESTORE_DATABASE": "production",
+        },
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, rejected_stderr = await rejected.communicate()
+    assert rejected.returncode != 0 and b"refusing" in rejected_stderr
+
+
+def test_expand_contract_rollback_guard_is_reversible_on_live_database() -> None:
+    environment = {**os.environ, "TEMIS_LAB_DATABASE_URL": settings.database_url}
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "0002_expand_authz_version"],
+        env=environment,
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        env=environment,
+        check=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_actual_codec_jwks_overlap_then_retirement(tmp_path: Path) -> None:
+    now = [0.0]
+    ring = KeyRing(tmp_path, clock=lambda: now[0], overlap_seconds=960)
+    old = ring.publish()
+    ring.activate(old)
+    codec = RingTokenCodec(ring)
+    old_token = codec.issue_access(
+        "user-1", roles=["temis:user"], scopes=["reports:read"], authz_version=1
+    )
+    new = ring.publish()
+
+    async def status(subject: str, version: int) -> bool:
+        return subject == "user-1" and version == 1
+
+    async def fetch() -> dict[str, object]:
+        return ring.jwks()
+
+    verifier = JwksVerifier(
+        fetch,
+        status,
+        issuer="https://auth.lab.invalid",
+        audience="temis-lab",
+        authorized_party="temis-web",
+        jwks_ttl=0,
+    )
+    assert (await verifier.authenticate(old_token)).subject == "user-1"
+    now[0] = 10
+    ring.activate(new)
+    new_token = codec.issue_access(
+        "user-1", roles=["temis:user"], scopes=["reports:read"], authz_version=1
+    )
+    assert (await verifier.authenticate(old_token)).subject == "user-1"
+    assert (await verifier.authenticate(new_token)).subject == "user-1"
+    with pytest.raises(ValueError, match="overlap"):
+        ring.retire(old)
+    now[0] = 970
+    ring.retire(old)
+    retired_verifier = JwksVerifier(
+        fetch,
+        status,
+        issuer="https://auth.lab.invalid",
+        audience="temis-lab",
+        authorized_party="temis-web",
+    )
+    with pytest.raises(TokenRejected):
+        await retired_verifier.authenticate(old_token)
+
+
+def test_concurrent_process_publishers_do_not_lose_records(tmp_path: Path) -> None:
+    code = (
+        "import sys; from pathlib import Path; "
+        "from temis_sso.keyring import KeyRing; KeyRing(Path(sys.argv[1])).publish()"
+    )
+
+    def publish(_: int) -> None:
+        subprocess.run([sys.executable, "-c", code, str(tmp_path)], check=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(publish, range(8)))
+    assert len(KeyRing(tmp_path).jwks()["keys"]) == 8
+
+
+=========================================
+=== File: ./tests/test_password_auth.py ===
+=========================================
+
+import asyncio
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from temis_sso.application.auth import mailbox
+from temis_sso.main import create_app
+from temis_sso.persistence import OneTimeToken, UserRepository, session_scope
+
+client = TestClient(create_app())
+
+
+def new_identity() -> tuple[str, str, str]:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    password = "correct horse battery"
+    response = client.post("/auth/register", json={"email": email, "password": password})
+    assert response.status_code == 201
+    return email, password, mailbox[(email, "verify")]
+
+
+def test_pending_user_must_verify_before_login() -> None:
+    email, password, token = new_identity()
+    assert (
+        client.post("/auth/login", json={"email": email, "password": password}).status_code == 403
+    )
+    assert client.post("/auth/verify", json={"token": token}).status_code == 204
+    assert client.post("/auth/verify", json={"token": token}).status_code == 400
+    assert (
+        client.post("/auth/login", json={"email": email, "password": password}).status_code == 200
+    )
+
+
+def test_password_is_hashed_and_reset_token_is_one_time() -> None:
+    email, _, verify_token = new_identity()
+    client.post("/auth/verify", json={"token": verify_token})
+    client.post("/auth/password-reset/request", json={"email": email})
+    reset = mailbox[(email, "reset")]
+    payload = {"token": reset, "password": "a different safe passphrase"}
+    assert client.post("/auth/password-reset/confirm", json=payload).status_code == 204
+    assert client.post("/auth/password-reset/confirm", json=payload).status_code == 400
+
+
+def test_three_failures_lock_account_until_expiry() -> None:
+    email, password, verify_token = new_identity()
+    client.post("/auth/verify", json={"token": verify_token})
+    bad = {"email": email, "password": "incorrect password"}
+    for _ in range(3):
+        assert client.post("/auth/login", json=bad).status_code == 401
+    assert (
+        client.post("/auth/login", json={"email": email, "password": password}).status_code == 401
+    )
+
+    async def expire_lock() -> None:
+        async with session_scope() as session:
+            user = await UserRepository(session).by_email(email)
+            assert user is not None
+            user.locked_until = datetime.now(UTC) - timedelta(seconds=1)
+
+    asyncio.run(expire_lock())
+    assert (
+        client.post("/auth/login", json={"email": email, "password": password}).status_code == 200
+    )
+
+
+def test_unknown_reset_request_has_same_public_response() -> None:
+    response = client.post("/auth/password-reset/request", json={"email": "absent@mail.test"})
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted"}
+
+
+@pytest.mark.asyncio
+async def test_expired_verification_token_is_rejected() -> None:
+    email, _, raw = new_identity()
+    async with session_scope() as session:
+        token = await session.scalar(
+            select(OneTimeToken).where(
+                OneTimeToken.user_id == (await UserRepository(session).by_email(email)).id
+            )
+        )
+        token.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert client.post("/auth/verify", json={"token": raw}).status_code == 400
+
+
+=========================================
+=== File: ./tests/test_request_flow.py ===
+=========================================
+
+import uuid
+
+from fastapi.testclient import TestClient
+
+from temis_sso.application.auth import mailbox
+from temis_sso.main import create_app
+from temis_sso.tokens import codec
+
+client = TestClient(create_app())
+
+
+def test_users_me_uses_active_database_identity() -> None:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    password = "correct horse battery"
+    created = client.post("/auth/register", json={"email": email, "password": password}).json()
+    client.post("/auth/verify", json={"token": mailbox[(email, "verify")]})
+    token = client.post("/auth/login", json={"email": email, "password": password}).json()[
+        "access_token"
+    ]
+    assert client.get("/users/me", headers={"Authorization": f"Bearer {token}"}).json() == {
+        "user_id": created["user_id"]
+    }
+
+
+def test_missing_invalid_and_deleted_identities_are_rejected() -> None:
+    assert client.get("/users/me").status_code == 401
+    assert client.get("/users/me", headers={"Authorization": "Bearer invalid"}).status_code == 401
+    unknown = codec.issue_access("deleted-user")
+    assert (
+        client.get("/users/me", headers={"Authorization": f"Bearer {unknown}"}).status_code == 404
+    )
+
+
+=========================================
+=== File: ./tests/test_resource_api.py ===
+=========================================
+
+import asyncio
+import base64
+import json
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from fastapi.testclient import TestClient
+
+from resource_api.app import create_resource_app
+from resource_api.auth import (
+    DependencyUnavailable,
+    JwksVerifier,
+    ScopeDenied,
+    TokenRejected,
+    require_scope,
+)
+from temis_sso.api.auth import issue_bundle
+from temis_sso.persistence import UserRepository, UserRole, session_scope
+from temis_sso.tokens import AUDIENCE, ISSUER, codec
+
+
+def token(**overrides: object) -> str:
+    return codec.issue_access(
+        str(overrides.get("user_id", "user-1")),
+        roles=["temis:user"],
+        audience=str(overrides.get("audience", AUDIENCE)),
+        client_id=str(overrides.get("client_id", "temis-web")),
+        scopes=list(overrides.get("scopes", ["reports:read"])),
+        authz_version=int(overrides.get("authz_version", 7)),
+    )
+
+
+def verifier(
+    clock: Callable[[], float] = lambda: 0.0,
+) -> tuple[JwksVerifier, list[tuple[str, int]], list[int]]:
+    status_calls: list[tuple[str, int]] = []
+    jwks_calls: list[int] = []
+
+    async def fetch() -> dict[str, object]:
+        jwks_calls.append(1)
+        return {"keys": [codec.jwk()]}
+
+    async def status(subject: str, version: int) -> bool:
+        status_calls.append((subject, version))
+        return subject == "user-1" and version == 7
+
+    return (
+        JwksVerifier(
+            fetch,
+            status,
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            authorized_party="temis-web",
+            clock=clock,
+        ),
+        status_calls,
+        jwks_calls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_token_binding_scope_and_namespaced_role() -> None:
+    checked, _, _ = verifier()
+    principal = await checked.authenticate(token())
+    assert principal.roles == {"temis:user"} and principal.authz_version == 7
+    require_scope(principal, "reports:read")
+    with pytest.raises(ScopeDenied):
+        require_scope(principal, "reports:write")
+    for invalid in [token(audience="other-api"), token(client_id="other-client")]:
+        with pytest.raises(TokenRejected):
+            await checked.authenticate(invalid)
+
+
+@pytest.mark.asyncio
+async def test_unknown_kid_refreshes_once_then_returns_401_semantics() -> None:
+    checked, _, calls = verifier()
+    other = codec.issue_access("user-1")
+    _, payload, signature = other.split(".")
+    altered = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "kid": "unknown"}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    with pytest.raises(TokenRejected):
+        await checked.authenticate(f"{altered}.{payload}.{signature}")
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_kid", [True, False])
+async def test_concurrent_unknown_kids_share_one_forced_refresh(same_kid: bool) -> None:
+    checked, _, calls = verifier()
+    await checked.authenticate(token())
+
+    def unknown(value: int) -> str:
+        _, payload, signature = token().split(".")
+        kid = "same-unknown" if same_kid else f"unknown-{value}"
+        header = (
+            base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "kid": kid}).encode())
+            .rstrip(b"=")
+            .decode()
+        )
+        return f"{header}.{payload}.{signature}"
+
+    results = await asyncio.gather(
+        *(checked.authenticate(unknown(index)) for index in range(20)),
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, TokenRejected) for result in results)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_status_cache_is_bounded_and_version_change_rechecks() -> None:
+    now = [0.0]
+    checked, status_calls, _ = verifier(lambda: now[0])
+    await checked.authenticate(token())
+    await checked.authenticate(token())
+    assert len(status_calls) == 1
+    now[0] = 31.0
+    await checked.authenticate(token())
+    assert len(status_calls) == 2
+    with pytest.raises(TokenRejected):
+        await checked.authenticate(token(authz_version=8))
+
+
+def test_http_boundary_distinguishes_401_and_403() -> None:
+    checked, _, _ = verifier()
+    client = TestClient(create_resource_app(checked))
+    assert client.get("/api/reports").status_code == 401
+    response = client.get(
+        "/api/reports",
+        headers={"Authorization": f"Bearer {token(scopes=['profile:read'])}"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_real_issue_bundle_carries_database_authorization_state() -> None:
+    async with session_scope() as session:
+        user = await UserRepository(session).create(f"{uuid.uuid4().hex}@mail.test")
+        user.status = "active"
+        user.authz_version = 9
+        session.add(UserRole(user_id=user.id, role="user"))
+        user_id = user.id
+    bundle = await issue_bundle(user_id)
+    claims = codec.verify_access(bundle.access_token)
+    assert claims["authz_version"] == 9
+    assert claims["https://temis.lab/roles"] == ["temis:user"]
+    assert "reports:read" in str(claims["scope"])
+
+
+def custom_token(**changes: object) -> str:
+    import jwt
+
+    claims = jwt.decode(token(), options={"verify_signature": False})
+    for key, value in changes.items():
+        if value is None:
+            claims.pop(key, None)
+        else:
+            claims[key] = value
+    ring = getattr(codec, "ring", None)
+    if ring is not None:
+        return ring.sign_claims(claims)
+    return jwt.encode(claims, codec._private_key, algorithm="RS256", headers={"kid": codec.kid})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"iss": "https://wrong.invalid"},
+        {"aud": [AUDIENCE, "other-api"]},
+        {"exp": datetime.now(UTC) - timedelta(seconds=1)},
+        {"nbf": datetime.now(UTC) + timedelta(minutes=5)},
+        {"scope": None},
+        {"azp": None},
+    ],
+)
+async def test_adversarial_claims_are_rejected(changes: dict[str, object]) -> None:
+    checked, _, _ = verifier()
+    with pytest.raises(TokenRejected):
+        await checked.authenticate(custom_token(**changes))
+
+
+@pytest.mark.asyncio
+async def test_dependency_outage_is_distinct_and_cached_jwks_can_bridge_briefly() -> None:
+    now = [0.0]
+    online = [True]
+
+    async def fetch() -> dict[str, object]:
+        if not online[0]:
+            raise ConnectionError("offline")
+        return {"keys": [codec.jwk()]}
+
+    async def status(subject: str, version: int) -> bool:
+        return True
+
+    checked = JwksVerifier(
+        fetch,
+        status,
+        issuer=ISSUER,
+        audience=AUDIENCE,
+        authorized_party="temis-web",
+        jwks_ttl=1,
+        jwks_stale_ttl=5,
+        status_ttl=60,
+        clock=lambda: now[0],
+    )
+    assert (await checked.authenticate(token())).subject == "user-1"
+    online[0] = False
+    now[0] = 2
+    assert (await checked.authenticate(token())).subject == "user-1"
+    now[0] = 7
+    with pytest.raises(DependencyUnavailable):
+        await checked.authenticate(token())
+
+
+@pytest.mark.asyncio
+async def test_inactive_status_and_status_outage_fail_closed() -> None:
+    async def fetch() -> dict[str, object]:
+        return {"keys": [codec.jwk()]}
+
+    async def inactive(subject: str, version: int) -> bool:
+        return False
+
+    async def outage(subject: str, version: int) -> bool:
+        raise ConnectionError("status offline")
+
+    for check, error in [(inactive, TokenRejected), (outage, DependencyUnavailable)]:
+        verified = JwksVerifier(
+            fetch,
+            check,
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            authorized_party="temis-web",
+        )
+        with pytest.raises(error):
+            await verified.authenticate(token())
+
+
+@pytest.mark.asyncio
+async def test_none_hmac_and_malformed_tokens_are_rejected_before_key_use() -> None:
+    import jwt
+
+    checked, _, _ = verifier()
+    claims = {"sub": "user-1", "exp": datetime.now(UTC) + timedelta(minutes=5)}
+    attacks = [
+        "not-a-jwt",
+        jwt.encode(claims, key="", algorithm="none", headers={"kid": codec.kid}),
+        jwt.encode(claims, key="attacker-secret", algorithm="HS256", headers={"kid": codec.kid}),
+    ]
+    for attack in attacks:
+        with pytest.raises(TokenRejected):
+            await checked.authenticate(attack)
+
+
+=========================================
+=== File: ./tests/test_system.py ===
+=========================================
+
+from fastapi.testclient import TestClient
+
+from temis_sso.main import create_app
+
+
+def test_health_and_security_headers() -> None:
+    response = TestClient(create_app()).get("/healthz")
+    assert response.json() == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_readiness_can_fail_without_leaking_configuration() -> None:
+    response = TestClient(create_app(ready=False)).get("/readyz")
+    assert response.status_code == 503
+    assert response.json() == {"error": {"code": "not_ready"}}
+    assert "database" not in response.text.lower()
+
+
+=========================================
+=== File: ./tests/test_tokens.py ===
+=========================================
+
+import concurrent.futures
+import uuid
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from temis_sso.application.auth import mailbox
+from temis_sso.keyring import KeyRing
+from temis_sso.main import create_app
+from temis_sso.tokens import RingTokenCodec, codec
+
+client = TestClient(create_app())
+
+
+def registered_login() -> dict[str, str]:
+    email = f"{uuid.uuid4().hex}@mail.test"
+    password = "correct horse battery"
+    client.post("/auth/register", json={"email": email, "password": password})
+    client.post("/auth/verify", json={"token": mailbox[(email, "verify")]})
+    response = client.post("/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_key_identity_is_stable_and_jwks_is_public_only() -> None:
+    second = RingTokenCodec(codec.ring)
+    assert codec.kid == second.kid
+    assert "d" not in client.get("/.well-known/jwks.json").json()["keys"][0]
+
+
+def test_missing_key_fails_fast(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not published"):
+        KeyRing(tmp_path).verification_key("missing")
+
+
+def test_access_token_reaches_current_user() -> None:
+    body = registered_login()
+    response = client.get("/users/me", headers={"Authorization": f"Bearer {body['access_token']}"})
+    assert response.status_code == 200
+
+
+def test_refresh_rotation_is_atomic_under_race() -> None:
+    first = registered_login()
+
+    def rotate() -> int:
+        return client.post(
+            "/auth/refresh", json={"refresh_token": first["refresh_token"]}
+        ).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(executor.map(lambda _: rotate(), range(2)))
+    assert statuses == [200, 401]
