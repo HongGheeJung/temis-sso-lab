@@ -1,35 +1,26 @@
-import base64
-import json
-import hashlib
+import secrets
 import time
 from urllib.parse import parse_qs, urlencode
-import secrets
-from typing import Annotated
 
 import httpx
-
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-
-from fastapi import Cookie
-from sqlalchemy import select
 
 from temis_sso.api.auth import TokenBundle, issue_bundle
 from temis_sso.client_policy import client_by_id, require_client
 from temis_sso.config import settings
-from temis_sso.fake_provider import FakeOAuthProvider
-from temis_sso.oauth_state import OAuthTransaction, pkce_challenge, state_store
-from temis_sso.persistence import UserRepository, UserRole, session_scope
-
-
-
 from temis_sso.external_idp.callback import GoogleCallbackService, JwksCache, verify_google_id_token
-from temis_sso.external_idp.external_accounts import ExternalIdentityLinkRepository, ExternalIdentityLink
+from temis_sso.external_idp.external_accounts import (
+    ExternalIdentityLink,
+    ExternalIdentityLinkRepository,
+)
 from temis_sso.external_idp.google import GoogleOidcAdapter
 from temis_sso.external_idp.security import FlowStore
 from temis_sso.external_idp.sessions import SessionStore
-
+from temis_sso.fake_provider import FakeOAuthProvider
+from temis_sso.oauth_state import OAuthTransaction, pkce_challenge, state_store
+from temis_sso.persistence import UserRepository, UserRole, session_scope
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
 provider = FakeOAuthProvider(state_store)
@@ -60,7 +51,6 @@ async def _oauth_user(provider_subject: str, default_role: str) -> str:
         return user.id
 
 async def _google_oauth_user(session, identity) -> str:
-    """구글유저 조회 및 가입, 연동"""
     user_repo = UserRepository(session)
     links_repo = ExternalIdentityLinkRepository(session)
     existing_link = await links_repo.get(identity.provider, identity.subject)
@@ -156,7 +146,6 @@ async def provider_callback(state: str, code: str) -> RedirectResponse:
 
 @router.post("/token", response_model=TokenBundle)
 async def token(request: Request, response: Response) -> TokenBundle:
-    from urllib.parse import parse_qs
 
     form = parse_qs((await request.body()).decode(), strict_parsing=True)
     try:
@@ -220,50 +209,45 @@ async def google_callback(state: str, code: str, idp_browser_binding: str | None
             detail="Security browser binding cookie is missing"
         )
         
-    async with session_scope() as session:
-        async with httpx.AsyncClient(timeout=5.0) as http_client:
+    async with session_scope() as session, httpx.AsyncClient(timeout=5.0) as http_client:
+        links_repo = ExternalIdentityLinkRepository(session)
+        adapter = GoogleOidcAdapter(settings.google_client_id, settings.google_client_secret, http_client)
+        
+        callback_service = GoogleCallbackService(
+            adapter=adapter, flows=flow_store, links=links_repo,
+            sessions=idp_session_store, http=http_client, jwks=jwks_cache
+        )
+        
+        try:
+            internal_session_id = await callback_service.finish_callback(
+                state=state, code=code, now=int(time.time()), browser_binding=idp_browser_binding
+            )
+            user_id = idp_session_store.resolve(internal_session_id)
             
-            links_repo = ExternalIdentityLinkRepository(session)
-            adapter = GoogleOidcAdapter(settings.google_client_id, settings.google_client_secret, http_client)
-           
-            callback_service = GoogleCallbackService(
-                adapter=adapter, flows=flow_store, links=links_repo,
-                sessions=idp_session_store, http=http_client, jwks=jwks_cache
+        except ValueError as error:
+            if "not linked" not in str(error):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error))
+                
+            flow_data = flow_store._flows.get(state)
+            if not flow_data:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid state token")
+            
+            metadata = await adapter.discover()
+            encoded_id_token = await adapter.exchange_code(metadata, code, flow_data)
+            
+            identity = await verify_google_id_token(
+                encoded_id_token, metadata, http_client, adapter.client_id, 
+                flow_data.nonce, jwks_cache, now=int(time.time()) + 60
             )
             
-            try:
-                internal_session_id = await callback_service.finish_callback(
-                    state=state, code=code, now=int(time.time()), browser_binding=idp_browser_binding
-                )
-                user_id = idp_session_store.resolve(internal_session_id)
-                
-            except ValueError as error:
-
-                if "not linked" not in str(error):
-                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error))
-                    
-                flow_data = flow_store._flows.get(state)
-
-                if not flow_data:
-                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid state token")
-                
-
-                metadata = await adapter.discover()
-                encoded_id_token = await adapter.exchange_code(metadata, code, flow_data)
-                
-                identity = await verify_google_id_token(
-                    encoded_id_token, metadata, http_client, adapter.client_id, 
-                    flow_data.nonce, jwks_cache, now=int(time.time()) + 60
-                )
-                
-                user_id = await _google_oauth_user(session, identity)
-                flow_store._flows.pop(state, None)
-                
-            except Exception as core_error:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"OAuth callback processing failed: {str(core_error)}"
-                )
+            user_id = await _google_oauth_user(session, identity)
+            flow_store._flows.pop(state, None)
+            
+        except (RuntimeError, httpx.HTTPError, KeyError) as core_error:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"OAuth callback processing failed: {core_error!s}"
+            )
 
     token_bundle = await issue_bundle(user_id, audience="lab-client")
     

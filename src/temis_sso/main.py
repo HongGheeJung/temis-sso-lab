@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from temis_sso.api.admin import router as admin_router
 from temis_sso.api.auth import router as auth_router
+from temis_sso.api.naver_oauth import router as naver_oauth_router
 from temis_sso.api.oauth import router as oauth_router
 from temis_sso.api.system import router as system_router
 from temis_sso.api.users import router as users_router
@@ -29,6 +30,7 @@ def create_app(ready: bool = True, log_sink: list[str] | None = None) -> FastAPI
     app.include_router(users_router)
     app.include_router(oauth_router)
     app.include_router(admin_router)
+    app.include_router(naver_oauth_router)
     install_observability(app, "sso", metrics, None if log_sink is None else log_sink.append)
     return app
 

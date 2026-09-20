@@ -20,6 +20,9 @@ class Settings(BaseSettings):
 
     google_client_id: str
     google_client_secret: str
+    
+    naver_client_id: str
+    naver_client_secret: str
 
 
 settings = Settings()
