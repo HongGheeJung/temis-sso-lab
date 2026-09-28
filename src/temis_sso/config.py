@@ -24,5 +24,8 @@ class Settings(BaseSettings):
     naver_client_id: str
     naver_client_secret: str
 
+    kakao_rest_api_key: str
+    kakao_client_secret: str
+
 
 settings = Settings()

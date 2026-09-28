@@ -19,8 +19,8 @@ class NaverAdapter:
         
     def authorization_request(self, flow: ExternalFlow) -> AuthorizationRequest:
         return AuthorizationRequest(
-            url=self.authorize_url,
-            parameters={
+            self.authorize_url,
+            {
                 "client_id": self.client_id,
                 "redirect_uri": flow.redirect_uri,
                 "response_type": "code",
@@ -30,15 +30,18 @@ class NaverAdapter:
         )
 
     async def exchange_code(self, code: str, state: str) -> str:
+        
+        data = {
+            "grant_type": "authorization_code",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "code": code,
+            "state": state,
+        }
+
         response = await self.http.post(
             self.token_url,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "code": code,
-                "state": state,
-            },
+            data=data,
             headers={"Accept": "application/json"}
         )
         response.raise_for_status()
@@ -48,9 +51,10 @@ class NaverAdapter:
             raise ValueError(f"Naver token endpoint rejected: {payload.get('error')}")
 
         token = payload.get("access_token")
-        if not token:
+        if not isinstance(token, str) or not token:
             raise ValueError("Token response is missing access_token")
-        return str(token)
+        
+        return token
 
     async def fetch_identity(self, access_token: str) -> ExternalIdentity:
         response = await self.http.get(
@@ -59,19 +63,19 @@ class NaverAdapter:
         )
         response.raise_for_status()
 
-        data = response.json()
-        resultcode = data.get("resultcode")
+        payload = response.json()
+        resultcode = payload.get("resultcode")
         
         if resultcode != "00":
-            raise ValueError(f"provider rejected: resultcode={resultcode}")
+            raise ValueError(f"Naver provider rejected: resultcode={resultcode}")
 
-        naver_response = data.get("response", {})
-        subject = naver_response.get("id")
-        
+        profile = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        subject = profile.get("id")
         if not subject or not str(subject).strip():
             raise ValueError("response.id")
 
-        email = naver_response.get("email")
+
+        email = profile.get("email")
         
         return ExternalIdentity(
             provider="naver",
