@@ -1,7 +1,6 @@
 from typing import Any
 
 import httpx
-import jwt
 
 from temis_sso.external_idp.models import (
     AuthorizationRequest,
@@ -112,63 +111,3 @@ class KakaoAdapter:
     async def unlink(self, access_token: str) -> bool:
         """카카오 연동 해제 엔드포인트를 호출하여 사용자 공급자 연결을 완전히 철회합니다."""
         return await self._account_operation(self.unlink_endpoint, access_token)
-
-
-class KakaoOidcAdapter:
-    """Optional OIDC verifier; live login deliberately uses the REST profile adapter.
-
-    Enable an OIDC flow only after configuring Kakao OIDC and requesting openid/nonce.
-    """
-
-    issuer = "https://kauth.kakao.com"
-    jwks_uri = "https://kauth.kakao.com/.well-known/jwks.json"
-
-    def __init__(self, client_id: str, http: httpx.AsyncClient) -> None:
-        self.client_id = client_id
-        self.http = http
-
-    async def verify(self, encoded_id_token: str, expected_nonce: str) -> ExternalIdentity:
-        unverified_header = jwt.get_unverified_header(encoded_id_token)
-        kid = unverified_header.get("kid")
-        if not kid:
-            raise ValueError("invalid")
-
-        jwks_res = await self.http.get(self.jwks_uri)
-        jwks_res.raise_for_status()
-        jwks_data = jwks_res.json()
-        keys = jwks_data.get("keys", [])
-
-        target_jwk = next((k for k in keys if k.get("kid") == kid), None)
-        if not target_jwk:
-            raise ValueError("invalid")
-
-        public_key = jwt.PyJWK.from_dict(target_jwk).key
-
-        try:
-            claims = jwt.decode(
-                encoded_id_token,
-                public_key,
-                algorithms=["RS256"],
-                audience=self.client_id,
-                options={"verify_signature": True, "require": ["exp", "iat", "iss", "aud", "sub"]},
-            )
-        except jwt.PyJWTError as e:
-            raise ValueError("invalid") from e
-
-        if claims.get("iss") != self.issuer:
-            raise ValueError("invalid")
-
-        if claims.get("nonce") != expected_nonce:
-            raise ValueError("nonce")
-
-        subject = claims.get("sub")
-        if not isinstance(subject, str) or not subject:
-            raise ValueError("invalid")
-
-        email = claims.get("email")
-        return ExternalIdentity(
-            provider="kakao",
-            subject=subject,
-            email=email if isinstance(email, str) else None,
-            email_verified=claims.get("email_verified") is True,
-        )

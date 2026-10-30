@@ -1,21 +1,13 @@
 import asyncio
-import json
 
 import httpx
-import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
-from jwt.algorithms import RSAAlgorithm
 
 from temis_sso.external_idp.google import GoogleOidcAdapter
-from temis_sso.external_idp.kakao import KakaoAdapter, KakaoOidcAdapter
+from temis_sso.external_idp.kakao import KakaoAdapter
 from temis_sso.external_idp.naver import NaverAdapter
 from temis_sso.external_idp.registry import ProviderRegistry
 from temis_sso.external_idp.security import FlowStore
-
-KAKAO_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-KAKAO_JWK = json.loads(RSAAlgorithm.to_jwk(KAKAO_PRIVATE_KEY.public_key()))
-KAKAO_JWK["kid"] = "kakao-key-1"
 
 
 def test_kakao_maps_numeric_id_and_consented_verified_email() -> None:
@@ -99,43 +91,14 @@ def test_kakao_email_requires_availability_consent_and_validity(
     assert asyncio.run(scenario()) == (None, False)
 
 
-def test_kakao_rest_rejects_sub_and_oidc_verifies_rs256_claims() -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v2/user/me":
-            return httpx.Response(200, json={"sub": "kakao-sub-7", "kakao_account": {}})
-        return httpx.Response(200, json={"keys": [KAKAO_JWK]})
+def test_kakao_rest_requires_numeric_id_instead_of_oidc_sub() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"sub": "kakao-sub-7", "kakao_account": {}})
 
     async def scenario() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(ValueError, match="id"):
                 await KakaoAdapter("local-kakao-client", client).fetch_identity("token")
-            verifier = KakaoOidcAdapter("local-kakao-client", client)
-            claims = {
-                "iss": "https://kauth.kakao.com",
-                "aud": "local-kakao-client",
-                "sub": "kakao-sub-7",
-                "nonce": "nonce-123",
-                "iat": 1_700_000_000,
-                "exp": 2_000_000_000,
-            }
-            encoded = jwt.encode(
-                claims,
-                KAKAO_PRIVATE_KEY,
-                algorithm="RS256",
-                headers={"kid": "kakao-key-1"},
-            )
-            assert (await verifier.verify(encoded, "nonce-123")).subject == "kakao-sub-7"
-            with pytest.raises(ValueError, match="nonce"):
-                await verifier.verify(encoded, "wrong-nonce")
-            claims["iss"] = "https://attacker.lab.invalid"
-            forged = jwt.encode(
-                claims,
-                KAKAO_PRIVATE_KEY,
-                algorithm="RS256",
-                headers={"kid": "kakao-key-1"},
-            )
-            with pytest.raises(ValueError, match="invalid"):
-                await verifier.verify(forged, "nonce-123")
 
     asyncio.run(scenario())
 

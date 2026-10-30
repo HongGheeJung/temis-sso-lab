@@ -37,9 +37,9 @@ No production deployment or database migration is required by this change.
 - Redirect URIs are configurable; defaults remain loopback development URLs.
   Non-loopback callbacks require HTTPS. Configure secure cookies for HTTPS.
 - Naver/Kakao routes now retrieve REST adapters from `ProviderRegistry`.
-  `KakaoOidcAdapter` remains a tested optional verifier, intentionally not used
-  by REST-profile login. Enabling Kakao OIDC requires a separate openid/nonce
-  flow; it must not silently replace the current REST path.
+  Unused Kakao OIDC verification code and its dedicated tests have been removed.
+  Kakao uses REST profile identity only; Google OIDC verification is retained.
+
 
 ## Naver documentation correction
 
