@@ -18,12 +18,18 @@ No production deployment or database migration is required by this change.
   They no longer redirect to `/docs` with access/refresh tokens in the URL.
   This deliberately changes the lab API contract: callers read the JSON body.
   It is not a production browser session or a frontend handoff implementation.
-- Naver/Kakao `POST /oauth/{provider}/revoke` requires application bearer
-  authentication and JSON `{"access_token":"provider-token"}` instead of a query
-  token. The provider profile must match the authenticated user's exact link
-  before the remote operation and local link removal. Failed profile checks,
-  ownership checks, provider operations or malformed success bodies retain the
-  local link. The lab accepts a fresh provider token rather than storing it.
+- Naver/Kakao `POST /oauth/{provider}/revoke` requires a social-login bearer
+  token with audience `lab-client`, an active DB user, and empty JSON `{}`.
+  It never accepts provider tokens from the caller. The successful callback
+  retains the provider token in server memory for 5 minutes, keyed by provider
+  and user ID. Restart/expiry returns 409 and requires a fresh provider login.
+  Run one worker. This is a lab implementation, not durable token storage.
+- The provider profile must match the authenticated user's exact link before
+  remote revocation and local deletion. Failed operations retain the link.
+  Success also removes the temporary server-side provider credential.
+- The social bearer verifier explicitly checks `lab-client`. It does not widen
+  the default audience accepted by other API endpoints. The regression tests
+  now use real signed bearer tokens without overriding the auth dependency.
 - Remote revocation and local deletion cannot be one atomic transaction. A local
   DB commit failure after remote success requires reconnect/recovery.
 - Credentials default to empty. Unconfigured providers return 503 instead of
@@ -69,7 +75,7 @@ Pop-Location
 
 `--noconftest` bypasses legacy tests/conftest.py, which automatically migrates
 Postgres and flushes Redis. Do not run that legacy setup against shared data.
-50 tests pass. Three existing PostgreSQL-dependent tests are deselected; the
+59 tests pass. Three existing PostgreSQL-dependent tests are deselected; the
 new tests independently exercise persistent account creation, repeat login,
 email collision, blocked users and transactional link deletion using SQLite.
 Changed production files pass Ruff and strict mypy. The complete PostgreSQL/

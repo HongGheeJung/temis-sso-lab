@@ -16,11 +16,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from temis_sso.api import kakao_oauth, naver_oauth, oauth, social
 from temis_sso.api.auth import TokenBundle
-from temis_sso.api.users import current_subject
 from temis_sso.config import Settings, settings
 from temis_sso.external_idp.external_accounts import ExternalIdentityLink
 from temis_sso.external_idp.models import ExternalIdentity
 from temis_sso.persistence import Base, User, UserRepository
+from temis_sso.tokens import codec
 
 
 @pytest_asyncio.fixture
@@ -35,8 +35,11 @@ async def lab(monkeypatch):
         async with factory() as session, session.begin():
             yield session
 
-    for module in (oauth, kakao_oauth, naver_oauth):
+    for module in (oauth, kakao_oauth, naver_oauth, social):
         monkeypatch.setattr(module, "session_scope", sessions)
+    monkeypatch.setattr(social, "provider_tokens", social.ProviderTokenStore())
+    monkeypatch.setattr(naver_oauth, "provider_tokens", social.provider_tokens)
+    monkeypatch.setattr(kakao_oauth, "provider_tokens", social.provider_tokens)
     for name in (
         "google_client_id",
         "google_client_secret",
@@ -56,10 +59,13 @@ async def lab(monkeypatch):
     app = FastAPI()
     for module in (oauth, kakao_oauth, naver_oauth):
         app.include_router(module.router)
-    app.dependency_overrides[current_subject] = lambda: "owner"
+
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000"
     ) as client:
+        client.headers["Authorization"] = "Bearer " + codec.issue_access(
+            "owner", audience="lab-client"
+        )
         yield client, sessions
     await engine.dispose()
 
@@ -147,6 +153,8 @@ async def test_first_and_repeat_login_consume_once_and_never_redirect_tokens(
         assert result.headers["cache-control"] == "no-store"
         assert result.json()["access_token"] == "local-access"
         user_ids.append(result.json()["user_id"])
+        if provider in {"naver", "kakao"}:
+            assert social.provider_tokens.get(provider, user_ids[-1]) == "provider-access"
         assert all(c.is_closed for c in clients)
         # Restore binding cookie to prove replay fails due to consumed state, not missing cookie.
         cookie_name = (
@@ -194,11 +202,16 @@ async def test_revoke_checks_profile_ownership_before_provider_and_db_delete(
         return httpx.Response(200) if provider == "naver" else httpx.Response(200, json={"id": 42})
 
     clients = providers(monkeypatch, handler)
-    response = await client.post(
-        f"/oauth/{provider}/revoke", json={"access_token": "provider-access"}
-    )
+    social.provider_tokens.put(provider, "owner", "provider-access")
+    response = await client.post(f"/oauth/{provider}/revoke", json={})
     assert response.status_code == expected, response.text
     assert len(operations) == int(owns)
+    if expected != 204:
+        assert social.provider_tokens.get(provider, "owner") == "provider-access"
+    else:
+        with pytest.raises(Exception) as error:
+            social.provider_tokens.get(provider, "owner")
+        assert error.value.status_code == 409
     assert all(c.is_closed for c in clients)
     async with sessions() as session:
         link = await session.get(ExternalIdentityLink, (provider, "42"))
@@ -207,7 +220,9 @@ async def test_revoke_checks_profile_ownership_before_provider_and_db_delete(
 
 @pytest.mark.parametrize("provider", ["naver", "kakao"])
 async def test_revoke_rejects_query_only_tokens(lab, provider):
-    client, _ = lab
+    client, sessions = lab
+    async with sessions() as session:
+        session.add(User(id="owner", email="owner@lab.invalid", status="active"))
     response = await client.post(f"/oauth/{provider}/revoke?access_token=old-client-token")
     assert response.status_code == 422
 
@@ -297,3 +312,48 @@ async def test_configured_callback_and_closed_login_http_client(lab, monkeypatch
     assert parse_qs(urlsplit(response.headers["location"]).query)["redirect_uri"] == [callback]
     assert "Secure" in response.headers["set-cookie"]
     assert all(c.is_closed for c in clients)
+
+
+@pytest.mark.parametrize("provider", ["naver", "kakao"])
+@pytest.mark.parametrize(
+    "audience,expected", [("lab-client", 409), ("temis-lab", 401), ("other-service", 401)]
+)
+async def test_revoke_uses_real_bearer_verification_and_requires_recent_login(
+    lab, provider, audience, expected
+):
+    client, sessions = lab
+    async with sessions() as session:
+        session.add(User(id="owner", email="owner@lab.invalid", status="active"))
+    client.headers["Authorization"] = "Bearer " + codec.issue_access("owner", audience=audience)
+    response = await client.post(f"/oauth/{provider}/revoke", json={})
+    assert response.status_code == expected
+
+
+@pytest.mark.parametrize("provider", ["naver", "kakao"])
+async def test_revoke_does_not_accept_client_supplied_provider_token(lab, provider):
+    client, sessions = lab
+    async with sessions() as session:
+        session.add(User(id="owner", email="owner@lab.invalid", status="active"))
+    response = await client.post(f"/oauth/{provider}/revoke", json={"access_token": "untrusted"})
+    assert response.status_code == 422
+
+
+def test_provider_tokens_expire_and_are_scoped_to_provider_and_user(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    now = 100.0
+    monkeypatch.setattr(social, "time", SimpleNamespace(monotonic=lambda: now))
+    store = social.ProviderTokenStore()
+    store.put("naver", "owner", "private-token")
+    assert store.get("naver", "owner") == "private-token"
+    for provider, user in [("kakao", "owner"), ("naver", "someone-else")]:
+        with pytest.raises(HTTPException) as error:
+            store.get(provider, user)
+        assert error.value.status_code == 409
+    now += 300
+    with pytest.raises(HTTPException) as error:
+        store.get("naver", "owner")
+    assert error.value.status_code == 409
+    assert not store._tokens

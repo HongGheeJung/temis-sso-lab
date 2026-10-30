@@ -1,10 +1,13 @@
 """Shared social account mapping and safe lab callback responses."""
 
 import secrets
+import time
+from typing import Annotated
 
-from fastapi import HTTPException
+import jwt
+from fastapi import Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,12 +18,58 @@ from temis_sso.external_idp.external_accounts import (
     ExternalIdentityLinkRepository,
 )
 from temis_sso.external_idp.models import ExternalIdentity
-from temis_sso.persistence import User, UserRepository, UserRole
+from temis_sso.persistence import User, UserRepository, UserRole, session_scope
+from temis_sso.tokens import codec
 
 
 class RevokeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    access_token: str = Field(min_length=1, max_length=8192, repr=False)
+    # No provider tokens may be supplied by the caller.
+
+
+class ProviderTokenStore:
+    """Short-lived process-local credentials for this single-worker lab only."""
+
+    def __init__(self, ttl_seconds: int = 300) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._tokens: dict[tuple[str, str], tuple[float, str]] = {}
+
+    def put(self, provider: str, user_id: str, token: str) -> None:
+        now = time.monotonic()
+        self._tokens = {key: value for key, value in self._tokens.items() if value[0] > now}
+        self._tokens[(provider, user_id)] = (now + self.ttl_seconds, token)
+
+    def get(self, provider: str, user_id: str) -> str:
+        key = (provider, user_id)
+        entry = self._tokens.get(key)
+        if entry is None or entry[0] <= time.monotonic():
+            self._tokens.pop(key, None)
+            raise HTTPException(
+                409, "Log in to this provider again before unlinking (within 5 minutes)"
+            )
+        return entry[1]
+
+    def discard(self, provider: str, user_id: str) -> None:
+        self._tokens.pop((provider, user_id), None)
+
+
+provider_tokens = ProviderTokenStore()
+
+
+async def social_subject(authorization: Annotated[str | None, Header()] = None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Bearer token required")
+    try:
+        user_id = str(
+            codec.verify_access(authorization.removeprefix("Bearer "), audience="lab-client")["sub"]
+        )
+    except (jwt.PyJWTError, KeyError) as error:
+        raise HTTPException(401, "Invalid social login access token") from error
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+        if user is None or user.status != "active":
+            raise HTTPException(403, "Account is not active")
+    return user_id
 
 
 def require_provider(provider: str) -> None:

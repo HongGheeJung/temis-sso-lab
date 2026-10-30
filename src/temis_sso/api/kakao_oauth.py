@@ -11,11 +11,12 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from temis_sso.api.social import (
     RevokeInput,
     login_result,
+    provider_tokens,
     require_owned_link,
     require_provider,
     resolve_social_user,
+    social_subject,
 )
-from temis_sso.api.users import current_subject
 from temis_sso.config import settings
 from temis_sso.external_idp.kakao import KakaoAdapter
 from temis_sso.external_idp.registry import ProviderRegistry
@@ -76,20 +77,24 @@ async def kakao_callback(
         raise HTTPException(401, "Invalid OAuth callback") from error
     except (httpx.HTTPError, RuntimeError, KeyError) as error:
         raise HTTPException(502, "Social login provider is unavailable") from error
-    return await login_result(user_id, "kakao_browser_binding")
+    result = await login_result(user_id, "kakao_browser_binding")
+    provider_tokens.put("kakao", user_id, access_token)
+    return result
 
 
 @router.post("/revoke", status_code=204)
-async def kakao_revoke(payload: RevokeInput, user_id: str = Depends(current_subject)) -> None:
+async def kakao_revoke(payload: RevokeInput, user_id: str = Depends(social_subject)) -> None:
     require_provider("kakao")
+    access_token = provider_tokens.get("kakao", user_id)
     try:
         async with httpx.AsyncClient(timeout=5.0) as http, session_scope() as session:
             adapter = _adapter(http)
-            identity = await adapter.fetch_identity(payload.access_token)
+            identity = await adapter.fetch_identity(access_token)
             link = await require_owned_link(session, user_id, identity)
-            if not await adapter.unlink(payload.access_token):
+            if not await adapter.unlink(access_token):
                 raise HTTPException(502, "Provider rejected revocation")
             await session.delete(link)
             await session.flush()
     except (ValueError, httpx.HTTPError, RuntimeError, KeyError) as error:
         raise HTTPException(502, "Provider revocation failed") from error
+    provider_tokens.discard("kakao", user_id)
