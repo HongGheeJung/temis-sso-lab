@@ -17,7 +17,9 @@ class KakaoAdapter:
     logout_endpoint = "https://kapi.kakao.com/v1/user/logout"
     unlink_endpoint = "https://kapi.kakao.com/v1/user/unlink"
 
-    def __init__(self, client_id: str, http: httpx.AsyncClient, client_secret: str | None = None) -> None:
+    def __init__(
+        self, client_id: str, http: httpx.AsyncClient, client_secret: str | None = None
+    ) -> None:
         self.client_id = client_id
         self.http = http
         self.client_secret = client_secret
@@ -35,9 +37,8 @@ class KakaoAdapter:
             },
         )
 
-
     async def exchange_code(self, code: str, flow: ExternalFlow) -> str:
-        
+
         data = {
             "grant_type": "authorization_code",
             "client_id": self.client_id,
@@ -49,9 +50,9 @@ class KakaoAdapter:
             data["client_secret"] = self.client_secret
 
         response = await self.http.post(
-            self.token_endpoint, 
+            self.token_endpoint,
             data=data,
-            headers={"Accept": "application/json"}  # 추가해도 무방하며 통일감을 줍니다.
+            headers={"Accept": "application/json"},  # 추가해도 무방하며 통일감을 줍니다.
         )
         response.raise_for_status()
 
@@ -62,7 +63,7 @@ class KakaoAdapter:
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise ValueError("Kakao token response is missing access_token")
-            
+
         return token
 
     async def fetch_identity(self, access_token: str) -> ExternalIdentity:
@@ -96,8 +97,14 @@ class KakaoAdapter:
             endpoint, headers={"Authorization": f"Bearer {access_token}"}
         )
         response.raise_for_status()
-        return response.status_code == 200
-    
+        payload = response.json()
+        subject = payload.get("id") if isinstance(payload, dict) else None
+        return (
+            response.status_code == 200
+            and isinstance(subject, int)
+            and not isinstance(subject, bool)
+        )
+
     async def logout(self, access_token: str) -> bool:
         """카카오 로그아웃 엔드포인트를 호출하여 세션을 유지한 채 토큰만 만료합니다."""
         return await self._account_operation(self.logout_endpoint, access_token)
@@ -107,9 +114,12 @@ class KakaoAdapter:
         return await self._account_operation(self.unlink_endpoint, access_token)
 
 
-
-
 class KakaoOidcAdapter:
+    """Optional OIDC verifier; live login deliberately uses the REST profile adapter.
+
+    Enable an OIDC flow only after configuring Kakao OIDC and requesting openid/nonce.
+    """
+
     issuer = "https://kauth.kakao.com"
     jwks_uri = "https://kauth.kakao.com/.well-known/jwks.json"
 
@@ -140,7 +150,7 @@ class KakaoOidcAdapter:
                 public_key,
                 algorithms=["RS256"],
                 audience=self.client_id,
-                options={"verify_signature": True, "require": ["exp", "iat", "iss", "aud", "sub"]}
+                options={"verify_signature": True, "require": ["exp", "iat", "iss", "aud", "sub"]},
             )
         except jwt.PyJWTError as e:
             raise ValueError("invalid") from e
@@ -160,5 +170,5 @@ class KakaoOidcAdapter:
             provider="kakao",
             subject=subject,
             email=email if isinstance(email, str) else None,
-            email_verified=claims.get("email_verified") is True
+            email_verified=claims.get("email_verified") is True,
         )

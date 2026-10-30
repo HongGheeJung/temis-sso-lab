@@ -129,3 +129,18 @@ def test_naver_transport_failure_fails_closed() -> None:
 
     with pytest.raises(httpx.ConnectError):
         asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [{"error": "invalid_request"}, [], "not-json"])
+def test_naver_revoke_rejects_error_or_malformed_success_body(body: object) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        if isinstance(body, str):
+            return httpx.Response(200, text=body)
+        return httpx.Response(200, json=body)
+
+    async def scenario() -> bool:
+        adapter, client = adapter_with(handler)
+        async with client:
+            return await adapter.revoke("naver-access")
+
+    assert asyncio.run(scenario()) is False

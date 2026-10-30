@@ -1,5 +1,3 @@
-from typing import Any
-
 import httpx
 
 from temis_sso.external_idp.models import AuthorizationRequest, ExternalFlow, ExternalIdentity
@@ -11,12 +9,11 @@ class NaverAdapter:
     profile_url = "https://openapi.naver.com/v1/nid/me"
     revoke_url = "https://nid.naver.com/oauth2.0/revoke"
 
-
     def __init__(self, client_id: str, client_secret: str, http: httpx.AsyncClient) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.http = http
-        
+
     def authorization_request(self, flow: ExternalFlow) -> AuthorizationRequest:
         return AuthorizationRequest(
             self.authorize_url,
@@ -30,7 +27,7 @@ class NaverAdapter:
         )
 
     async def exchange_code(self, code: str, state: str) -> str:
-        
+
         data = {
             "grant_type": "authorization_code",
             "client_id": self.client_id,
@@ -40,9 +37,7 @@ class NaverAdapter:
         }
 
         response = await self.http.post(
-            self.token_url,
-            data=data,
-            headers={"Accept": "application/json"}
+            self.token_url, data=data, headers={"Accept": "application/json"}
         )
         response.raise_for_status()
 
@@ -53,19 +48,18 @@ class NaverAdapter:
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise ValueError("Token response is missing access_token")
-        
+
         return token
 
     async def fetch_identity(self, access_token: str) -> ExternalIdentity:
         response = await self.http.get(
-            self.profile_url,
-            headers={"Authorization": f"Bearer {access_token}"}
+            self.profile_url, headers={"Authorization": f"Bearer {access_token}"}
         )
         response.raise_for_status()
 
         payload = response.json()
         resultcode = payload.get("resultcode")
-        
+
         if resultcode != "00":
             raise ValueError(f"Naver provider rejected: resultcode={resultcode}")
 
@@ -74,17 +68,16 @@ class NaverAdapter:
         if not subject or not str(subject).strip():
             raise ValueError("response.id")
 
-
         email = profile.get("email")
-        
+
         return ExternalIdentity(
             provider="naver",
             subject=str(subject),
             email=email if isinstance(email, str) else None,
-            email_verified=False
+            email_verified=False,
         )
 
-    async def revoke(self, access_token: str) -> bool:       
+    async def revoke(self, access_token: str) -> bool:
         response = await self.http.post(
             self.revoke_url,
             data={
@@ -92,7 +85,16 @@ class NaverAdapter:
                 "client_secret": self.client_secret,
                 "token": access_token,
                 "token_type_hint": "access_token",
-            }
+            },
         )
         response.raise_for_status()
-        return response.status_code == 200
+        if response.status_code != 200:
+            return False
+        # Current Naver spec returns an empty 200. Reject error envelopes defensively.
+        if not response.content:
+            return True
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and not payload.get("error")

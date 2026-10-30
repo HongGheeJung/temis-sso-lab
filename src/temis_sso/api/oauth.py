@@ -3,16 +3,17 @@ import time
 from urllib.parse import parse_qs, urlencode
 
 import httpx
+import jwt
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from temis_sso.api.auth import TokenBundle, issue_bundle
+from temis_sso.api.social import login_result, require_provider, resolve_social_user
 from temis_sso.client_policy import client_by_id, require_client
 from temis_sso.config import settings
-from temis_sso.external_idp.callback import GoogleCallbackService, JwksCache, verify_google_id_token
+from temis_sso.external_idp.callback import GoogleCallbackService, JwksCache
 from temis_sso.external_idp.external_accounts import (
-    ExternalIdentityLink,
     ExternalIdentityLinkRepository,
 )
 from temis_sso.external_idp.google import GoogleOidcAdapter
@@ -49,34 +50,6 @@ async def _oauth_user(provider_subject: str, default_role: str) -> str:
             user.status = "active"
             session.add(UserRole(user_id=user.id, role=default_role))
         return user.id
-
-async def _google_oauth_user(session, identity) -> str:
-    user_repo = UserRepository(session)
-    links_repo = ExternalIdentityLinkRepository(session)
-    existing_link = await links_repo.get(identity.provider, identity.subject)
-    
-    if existing_link:
-        return existing_link.user_id
-
-    target_email = identity.email or f"{identity.subject}@google.lab.invalid"
-    user = await user_repo.by_email(target_email)
-    
-    if user is None:
-        user = await user_repo.create(target_email)
-        user.status = "active"
-        session.add(UserRole(user_id=user.id, role="user"))
-        await session.flush()
-    
-    session.add(ExternalIdentityLink(
-        provider=identity.provider,
-        subject=identity.subject,
-        user_id=user.id
-    ))
-    await session.flush()
-    
-    return user.id
-
-
 
 
 @router.get("/authorize")
@@ -170,92 +143,55 @@ async def token(request: Request, response: Response) -> TokenBundle:
 
 @router.get("/google/login")
 async def google_login() -> RedirectResponse:
-
-    browser_binding = secrets.token_urlsafe(32)
-
-    http_client = httpx.AsyncClient(timeout=5.0)
-    adapter = GoogleOidcAdapter(settings.google_client_id, settings.google_client_secret, http_client)
-    metadata = await adapter.discover()    
-    redirect_uri = "http://localhost:8000/oauth/google/callback"
-        
-    flow = flow_store.issue(
-        redirect_uri=redirect_uri,
-        now=int(time.time()),
-        browser_binding=browser_binding
-    )
- 
-    auth_request = adapter.authorization_request(metadata, flow)       
-    target_url = f"{auth_request.url}?{urlencode(auth_request.parameters)}"       
-    
-    response = RedirectResponse(url=target_url, status_code=status.HTTP_303_SEE_OTHER)    
+    require_provider("google")
+    binding = secrets.token_urlsafe(32)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            adapter = GoogleOidcAdapter(
+                settings.google_client_id, settings.google_client_secret, http
+            )
+            metadata = await adapter.discover()
+            flow = flow_store.issue(settings.google_redirect_uri, int(time.time()), binding)
+            auth = adapter.authorization_request(metadata, flow)
+    except (ValueError, httpx.HTTPError) as error:
+        raise HTTPException(502, "Social login provider is unavailable") from error
+    response = RedirectResponse(f"{auth.url}?{urlencode(auth.parameters)}", status_code=303)
     response.set_cookie(
-        key="idp_browser_binding",
-        value=browser_binding,
+        "idp_browser_binding",
+        binding,
         httponly=True,
-        secure=False, 
+        secure=settings.oauth_cookie_secure,
         samesite="lax",
-        max_age=300
+        max_age=300,
     )
     return response
 
 
-
-
 @router.get("/google/callback")
-async def google_callback(state: str, code: str, idp_browser_binding: str | None = Cookie(None)) -> RedirectResponse:
+async def google_callback(
+    state: str, code: str, idp_browser_binding: str | None = Cookie(None)
+) -> JSONResponse:
+    require_provider("google")
     if not idp_browser_binding:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Security browser binding cookie is missing"
-        )
-        
-    async with session_scope() as session, httpx.AsyncClient(timeout=5.0) as http_client:
-        links_repo = ExternalIdentityLinkRepository(session)
-        adapter = GoogleOidcAdapter(settings.google_client_id, settings.google_client_secret, http_client)
-        
-        callback_service = GoogleCallbackService(
-            adapter=adapter, flows=flow_store, links=links_repo,
-            sessions=idp_session_store, http=http_client, jwks=jwks_cache
-        )
-        
-        try:
-            internal_session_id = await callback_service.finish_callback(
-                state=state, code=code, now=int(time.time()), browser_binding=idp_browser_binding
+        raise HTTPException(400, "Security browser binding cookie is missing")
+    try:
+        async with session_scope() as session, httpx.AsyncClient(timeout=5.0) as http:
+            service = GoogleCallbackService(
+                adapter=GoogleOidcAdapter(
+                    settings.google_client_id, settings.google_client_secret, http
+                ),
+                flows=flow_store,
+                links=ExternalIdentityLinkRepository(session),
+                sessions=idp_session_store,
+                http=http,
+                jwks=jwks_cache,
             )
-            user_id = idp_session_store.resolve(internal_session_id)
-            
-        except ValueError as error:
-            if "not linked" not in str(error):
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error))
-                
-            flow_data = flow_store._flows.get(state)
-            if not flow_data:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid state token")
-            
-            metadata = await adapter.discover()
-            encoded_id_token = await adapter.exchange_code(metadata, code, flow_data)
-            
-            identity = await verify_google_id_token(
-                encoded_id_token, metadata, http_client, adapter.client_id, 
-                flow_data.nonce, jwks_cache, now=int(time.time()) + 60
+            identity = await service.authenticate_identity(
+                state, code, int(time.time()), idp_browser_binding
             )
-            
-            user_id = await _google_oauth_user(session, identity)
-            flow_store._flows.pop(state, None)
-            
-        except (RuntimeError, httpx.HTTPError, KeyError) as core_error:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"OAuth callback processing failed: {core_error!s}"
-            )
-
-    token_bundle = await issue_bundle(user_id, audience="lab-client")
-    
-    query = urlencode({
-        "access_token": token_bundle.access_token,
-        "refresh_token": token_bundle.refresh_token,
-        "token_type": token_bundle.token_type
-    })
-    
-    Redirect_url = f"http://localhost:8000/docs?{query}"
-    return RedirectResponse(url=Redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+            user_id = await resolve_social_user(session, identity)
+    except (ValueError, jwt.PyJWTError) as error:
+        raise HTTPException(401, "Invalid OAuth callback") from error
+    except (httpx.HTTPError, RuntimeError, KeyError) as error:
+        raise HTTPException(502, "Social login provider is unavailable") from error
+    return await login_result(user_id, "idp_browser_binding")

@@ -110,7 +110,9 @@ class GoogleCallbackService:
         self.http = http
         self.jwks = jwks
 
-    async def finish_callback(self, state: str, code: str, now: int, browser_binding: str) -> str:
+    async def authenticate_identity(
+        self, state: str, code: str, now: int, browser_binding: str
+    ) -> ExternalIdentity:
         flow = self.flows.consume(state, now, browser_binding)
         metadata = await self.adapter.discover()
         encoded = await self.adapter.exchange_code(metadata, code, flow)
@@ -123,6 +125,10 @@ class GoogleCallbackService:
             self.jwks,
             now,
         )
+        return identity
+
+    async def finish_callback(self, state: str, code: str, now: int, browser_binding: str) -> str:
+        identity = await self.authenticate_identity(state, code, now, browser_binding)
         user_id = await self.links.resolve(identity.provider, identity.subject)
         if user_id is None:
             raise ValueError("external identity is not linked")
